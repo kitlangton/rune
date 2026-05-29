@@ -19,23 +19,25 @@ import { expect } from "bun:test"
 import fc from "fast-check"
 import { Effect } from "effect"
 import { Rune, type DiagnosticKind, type ExecuteResult, type ExecutionLimits } from "./rune.ts"
-import { RunePromise, type PromiseTools } from "./promise.ts"
+import { Rune as PromiseRune } from "./promise.ts"
 import type { HostTools } from "./tool-runtime.ts"
 
 // ── Driving the runtime ──────────────────────────────────────────────────────
 
-export type RunOptions = { readonly tools?: PromiseTools; readonly limits?: ExecutionLimits }
+type TestTools = { readonly [name: string]: ((...args: Array<unknown>) => unknown | PromiseLike<unknown>) | TestTools }
+
+export type RunOptions = { readonly tools?: TestTools; readonly limits?: ExecutionLimits }
 
 /** Execute a program through the Promise-facing runtime. */
 export const run = (code: string, options: RunOptions = {}): Promise<ExecuteResult> =>
-  RunePromise.execute({ code, ...options })
+  PromiseRune.execute({ code, ...options } as never)
 
 /** Execute a program through the Effect-native runtime (Effect tools, described tools). */
 export const runEffect = (
   code: string,
   options: { readonly tools?: HostTools; readonly limits?: ExecutionLimits } = {},
 ): Promise<ExecuteResult> => {
-  const program = Rune.make(options).run(code) as Effect.Effect<ExecuteResult, never, never>
+  const program = Rune.make(options as never).run(code) as Effect.Effect<ExecuteResult, never, never>
   return Effect.runPromise(program)
 }
 
@@ -171,14 +173,14 @@ const dataValue: fc.Arbitrary<unknown> = fc.letrec<{ data: unknown }>((tie) => (
  */
 const grammar = fc.letrec<{ num: string; bool: string; arr: string; str: string }>((tie) => ({
   num: fc.oneof(
-    { maxDepth: 3 },
+    { maxDepth: 5, depthIdentifier: "expr" },
     fc.integer({ min: -1000, max: 1000 }).map(String),
     fc.tuple(tie("num"), fc.constantFrom("+", "-", "*"), tie("num")).map(([a, op, b]) => `(${a} ${op} ${b})`),
     fc.tuple(tie("bool"), tie("num"), tie("num")).map(([c, t, e]) => `(${c} ? ${t} : ${e})`),
     tie("arr").map((a) => `${a}.length`),
   ),
   bool: fc.oneof(
-    { maxDepth: 3 },
+    { maxDepth: 5, depthIdentifier: "expr" },
     fc.boolean().map(String),
     fc.tuple(tie("num"), fc.constantFrom("===", "!==", "<", "<=", ">", ">="), tie("num")).map(([a, op, b]) => `(${a} ${op} ${b})`),
     fc.tuple(tie("bool"), fc.constantFrom("&&", "||"), tie("bool")).map(([a, op, b]) => `(${a} ${op} ${b})`),
@@ -187,13 +189,13 @@ const grammar = fc.letrec<{ num: string; bool: string; arr: string; str: string 
     fc.tuple(tie("arr"), tie("num")).map(([a, n]) => `${a}.every((x) => (x >= (${n})))`),
   ),
   arr: fc.oneof(
-    { maxDepth: 3 },
+    { maxDepth: 5, depthIdentifier: "expr" },
     fc.array(fc.integer({ min: -1000, max: 1000 }), { maxLength: 5 }).map((xs) => `[${xs.join(", ")}]`),
     fc.tuple(tie("arr"), tie("num")).map(([a, n]) => `${a}.map((x) => (x + (${n})))`),
     fc.tuple(tie("arr"), tie("num")).map(([a, n]) => `${a}.filter((x) => (x < (${n})))`),
   ),
   str: fc.oneof(
-    { maxDepth: 2 },
+    { maxDepth: 5, depthIdentifier: "expr" },
     fc.string({ maxLength: 6 }).map((s) => JSON.stringify(s)),
     fc.tuple(tie("str"), tie("str")).map(([a, b]) => `(${a} + ${b})`),
     fc.tuple(tie("str"), tie("num")).map(([a, b]) => `(${a} + ${b})`),

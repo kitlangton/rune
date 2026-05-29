@@ -12,7 +12,7 @@ An explicit host operation addressed through a `tools.*` path inside a Rune Prog
 
 ### Described Tool Capability
 
-A Tool Capability registered with a description, input and output Effect Schemas, and an Effect implementation. Rune derives a compact TypeScript capability signature from the schemas. Described Tool Capabilities appear in host-generated instructions and are discoverable through `tools.search(...)` and inspectable through `tools.describe(...)`.
+A Tool Capability registered with a description, input and output Effect Schemas, and an Effect implementation. Rune derives a compact TypeScript capability signature from the schemas. Described Tool Capabilities appear in host-generated instructions and are discoverable through the reserved, policy-addressable `tools.$rune.search(...)` and `tools.$rune.describe(...)` capabilities.
 
 ### Data Value
 
@@ -44,11 +44,11 @@ The compact host-generated prompt text produced by `rune.instructions()`. `rune.
 
 ### Code Tool
 
-The single agent-facing tool produced by `rune.tool()`. Its description is Instructions and its input is a Rune Program string. A Code Tool replaces exposure of individual Tool Capabilities to an agent framework.
+The single agent-facing tool produced by `rune.asTool()`. Its description is Instructions and its input is a Rune Program string. A Code Tool replaces exposure of individual Tool Capabilities to an agent framework.
 
 ### Adapter
 
-A framework-specific conversion of the neutral Code Tool. `RuneAiSdk` exposes a Vercel AI SDK tool; `RuneEffectAi` exposes an Effect AI Toolkit and handler layer. Additional agent systems can implement Adapters from `rune.tool()`.
+A framework-specific conversion of the neutral Code Tool. `RuneAiSdk` exposes a Vercel AI SDK tool; `RuneEffectAi` exposes an Effect AI Toolkit and handler layer. Additional agent systems can implement Adapters from `rune.asTool()`.
 
 ### Policy
 

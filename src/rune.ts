@@ -2,11 +2,11 @@ import { parse } from "acorn"
 import { Cause, Effect, Schema } from "effect"
 import { DiagnosticCategory, ModuleKind, ScriptTarget, flattenDiagnosticMessageText, transpileModule } from "typescript"
 import {
-  ToolReference,
   copyIn,
   copyOut,
   dataByteLength,
   isBlockedMember,
+  ToolReference,
   ToolRuntime,
   ToolRuntimeError,
   type HostTools,
@@ -14,11 +14,17 @@ import {
   type ToolCall,
   type ToolDescription,
   type Services,
-} from "./tool-runtime.ts"
-import type { Policy, RequestApproval } from "./policy.ts"
+} from "./tool-runtime.js"
+import type * as Policy from "./policy.js"
+import type { RequestApproval } from "./policy.js"
+import type { Definition } from "./tool.js"
+import { CapabilityError } from "./capability-error.js"
 
-export type { HostTool, HostTools, ToolCall, ToolDescription } from "./tool-runtime.ts"
+export type { ToolCall, ToolDescription } from "./tool-runtime.js"
+export { Tool } from "./tool.js"
+export { CapabilityError } from "./capability-error.js"
 
+/** Resource budgets enforced during each Rune Program execution. */
 export type ExecutionLimits = {
   readonly maxOperations?: number
   readonly maxToolCalls?: number
@@ -29,6 +35,10 @@ export type ExecutionLimits = {
   readonly maxValueDepth?: number
   readonly maxCollectionLength?: number
   readonly timeoutMs?: number
+}
+
+type CapabilityTree<R = never> = {
+  readonly [name: string]: Definition<R> | CapabilityTree<R>
 }
 
 type ResolvedExecutionLimits = {
@@ -45,9 +55,9 @@ type ResolvedExecutionLimits = {
 
 export type ExecuteOptions<Tools extends Record<string, unknown> = {}, RA = never> = {
   code: string
-  tools?: Tools & HostTools<any>
+  tools?: Tools & CapabilityTree<any>
   policy?: Policy.Config<Tools>
-  requestApproval?: RequestApproval<Policy.CapabilityPath<Tools>, RA>
+  requestApproval?: RequestApproval<Policy.CapabilityPath<Tools> | Policy.BuiltinPath, RA>
   limits?: ExecutionLimits
 }
 
@@ -55,7 +65,7 @@ export type ExecuteResult =
   | {
       ok: true
       value: unknown
-      toolCalls: Array<ToolCall>
+      toolCalls: ReadonlyArray<ToolCall>
     }
   | {
       ok: false
@@ -65,12 +75,38 @@ export type ExecuteResult =
         location?: { readonly line: number; readonly column: number }
         suggestions?: ReadonlyArray<string>
       }
-      toolCalls: Array<ToolCall>
+      toolCalls: ReadonlyArray<ToolCall>
     }
 
 export type RuneOptions<Tools extends Record<string, unknown> = {}, RA = never> = Omit<ExecuteOptions<Tools, RA>, "code">
 
+/** Input schema for the single agent-facing tool produced by `rune.asTool()`. */
 export const CodeInput = Schema.Struct({ code: Schema.String })
+
+const DiagnosticKindSchema = Schema.Literals([
+  "ParseError", "UnsupportedSyntax", "UnknownCapability", "InvalidToolInput", "InvalidToolOutput", "InvalidDataValue",
+  "OperationLimitExceeded", "ToolCallLimitExceeded", "AuditLimitExceeded", "ConcurrencyLimitExceeded", "TimeoutExceeded",
+  "CapabilityDenied", "ApprovalDenied", "CapabilityFailure", "ExecutionFailure",
+])
+
+/** Structured success or diagnostic result schema returned by Rune execution. */
+export const ExecuteResultSchema = Schema.Union([
+  Schema.Struct({
+    ok: Schema.Literal(true),
+    value: Schema.Unknown,
+    toolCalls: Schema.Array(Schema.Struct({ name: Schema.String, args: Schema.Array(Schema.Unknown) })),
+  }),
+  Schema.Struct({
+    ok: Schema.Literal(false),
+    error: Schema.Struct({
+      kind: DiagnosticKindSchema,
+      message: Schema.String,
+      location: Schema.optional(Schema.Struct({ line: Schema.Number, column: Schema.Number })),
+      suggestions: Schema.optional(Schema.Array(Schema.String)),
+    }),
+    toolCalls: Schema.Array(Schema.Struct({ name: Schema.String, args: Schema.Array(Schema.Unknown) })),
+  }),
+])
 
 export type CodeTool<R = never> = {
   readonly name: "code"
@@ -80,9 +116,13 @@ export type CodeTool<R = never> = {
 }
 
 export type Rune<R = never> = {
+  /** Lists policy-visible, schema-described capability paths. */
   readonly catalog: () => ReadonlyArray<ToolDescription>
+  /** Builds model-facing syntax guidance and visible capability signatures. */
   readonly instructions: () => string
-  readonly tool: () => CodeTool<R>
+  /** Projects the configured runtime as one agent-facing `code` tool. */
+  readonly asTool: () => CodeTool<R>
+  /** Executes a program using this runtime's configured tools and policy. */
   readonly run: (code: string) => Effect.Effect<ExecuteResult, never, R>
 }
 
@@ -110,6 +150,10 @@ type ProgramNode = AstNode & {
 type Binding = {
   mutable: boolean
   value: unknown
+  // Absent means initialized. `false` marks a parameter binding seeded into its scope but not
+  // yet bound, so a default that forward-references a later parameter sees a TDZ error (as in JS)
+  // rather than silently resolving to an outer binding of the same name.
+  initialized?: boolean
 }
 
 type StatementResult =
@@ -155,7 +199,7 @@ class GlobalNamespace {
 }
 
 class GlobalMethodReference {
-  constructor(readonly namespace: "Object" | "Math" | "JSON" | "Array", readonly name: string) {}
+  constructor(readonly namespace: "Object" | "Math" | "JSON" | "Array" | "Number" | "String", readonly name: string) {}
 }
 
 // A built-in callable global (`Number`, `String`, `Boolean`, `parseInt`, `parseFloat`).
@@ -181,22 +225,40 @@ export type DiagnosticKind =
   | "TimeoutExceeded"
   | "CapabilityDenied"
   | "ApprovalDenied"
+  | "CapabilityFailure"
   | "ExecutionFailure"
 
 const arrayMethods = new Set([
-  "map", "filter", "find", "findIndex", "some", "every", "includes", "join",
-  "reduce", "flatMap", "forEach", "sort", "slice", "concat", "indexOf", "lastIndexOf",
-  "at", "flat", "reverse",
+  "map", "filter", "find", "findIndex", "findLast", "findLastIndex", "some", "every", "includes", "join",
+  "reduce", "reduceRight", "flatMap", "forEach", "sort", "toSorted", "slice", "concat", "indexOf", "lastIndexOf",
+  "at", "flat", "reverse", "toReversed", "with", "push", "pop", "shift", "unshift",
 ])
-const retryableArrayMethods = new Set(["splice", "fill", "copyWithin", "reduceRight", "keys", "values", "entries"])
+const retryableArrayMethods = new Set(["splice", "fill", "copyWithin", "keys", "values", "entries"])
+
+/**
+ * Array methods whose cost is O(1) (or bounded by the argument count), so they must
+ * NOT be charged the receiver's length. Charging `push` per element would make an
+ * accumulation loop quadratic in the operation budget and trip it on legitimate code.
+ */
+const cheapArrayMethods = new Set(["push", "pop", "at"])
 
 const mathConstants = new Set(["PI", "E", "LN2", "LN10", "LOG2E", "LOG10E", "SQRT2", "SQRT1_2"])
 
+const numberMethods = new Set(["toFixed", "toPrecision", "toExponential", "toString"])
+
 const stringMethods = new Set([
-  "toLowerCase", "toUpperCase", "trim", "trimStart", "trimEnd", "split", "slice",
+  "toLowerCase", "toUpperCase", "trim", "trimStart", "trimEnd", "split", "slice", "substring", "substr",
   "includes", "startsWith", "endsWith", "indexOf", "lastIndexOf", "replace", "replaceAll",
-  "repeat", "padStart", "padEnd", "charAt", "at", "concat",
+  "repeat", "padStart", "padEnd", "charAt", "charCodeAt", "codePointAt", "at", "concat", "toString",
 ])
+
+const numberConstants = new Set(["MAX_SAFE_INTEGER", "MIN_SAFE_INTEGER", "MAX_VALUE", "MIN_VALUE", "EPSILON"])
+
+const numberStatics = new Set(["isInteger", "isFinite", "isNaN", "isSafeInteger", "parseInt", "parseFloat"])
+
+const stringStatics = new Set(["fromCharCode", "fromCodePoint"])
+
+const errorConstructors = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError"])
 
 const OptionalShortCircuit: unique symbol = Symbol("rune.optional-short-circuit")
 
@@ -361,6 +423,30 @@ const normalizeError = (error: unknown): Diagnostic => {
     }
   }
 
+  if (error instanceof CapabilityError) {
+    return { kind: "CapabilityFailure", message: publicErrorMessage(error.message) }
+  }
+
+  if (error instanceof ProgramThrow) {
+    const value = error.value
+    let message: string
+    if (containsRuntimeReference(value)) {
+      // A thrown capability/function reference must not leak its internal structure.
+      message = "a non-data value"
+    } else if (typeof value === "string") {
+      message = value
+    } else if (value !== null && typeof value === "object" && typeof (value as { message?: unknown }).message === "string") {
+      message = (value as { message: string }).message
+    } else {
+      try {
+        message = JSON.stringify(copyOut(value)) ?? String(value)
+      } catch {
+        message = String(value)
+      }
+    }
+    return { kind: "ExecutionFailure", message: `Uncaught: ${message}` }
+  }
+
   if (error instanceof RangeError && /call stack|recursion/i.test(error.message)) {
     return {
       kind: "ExecutionFailure",
@@ -375,9 +461,11 @@ const normalizeError = (error: unknown): Diagnostic => {
     }
   }
 
+  // A non-Error thrown by a host tool (raw string / number / Symbol) still routes through
+  // path redaction so filesystem paths can never leak through the catch-all branch.
   return {
     kind: "ExecutionFailure",
-    message: String(error),
+    message: publicErrorMessage(String(error)),
   }
 }
 
@@ -456,6 +544,13 @@ const boundedProgramValue = (value: unknown, label: string, node: AstNode, limit
     throw new InterpreterRuntimeError(`${label} exceeds the maximum data size of ${limits.maxDataBytes} bytes.`, node, "InvalidDataValue")
   }
   return value
+}
+
+// A cheap proxy for the work an O(n) built-in performed, used to charge the operation budget.
+const workUnits = (value: unknown): number => {
+  if (typeof value === "string" || Array.isArray(value)) return value.length
+  if (value !== null && typeof value === "object") return Object.keys(value).length
+  return 1
 }
 
 const invokeStringMethod = (value: string, name: string, args: Array<unknown>, node: AstNode, limits: ResolvedExecutionLimits): unknown => {
@@ -545,8 +640,15 @@ const invokeStringMethod = (value: string, name: string, args: Array<unknown>, n
       result = value.padEnd(length, optStr(1))
       break
     }
-    case "charAt": result = value.charAt(num(0)); break
-    case "at": result = value.at(num(0)); break
+    case "charAt": result = value.charAt(optNum(0) ?? 0); break
+    case "at": result = value.at(optNum(0) ?? 0); break
+    case "substring": result = value.substring(optNum(0) ?? 0, optNum(1)); break
+    case "substr": result = value.substr(optNum(0) ?? 0, optNum(1)); break
+    // JS charCodeAt returns NaN out of range, but Rune forbids NaN as a Data Value;
+    // yield undefined instead, matching codePointAt and `at` (the other absent-slot sentinels).
+    case "charCodeAt": { const code = value.charCodeAt(optNum(0) ?? 0); result = Number.isNaN(code) ? undefined : code; break }
+    case "codePointAt": result = value.codePointAt(optNum(0) ?? 0); break
+    case "toString": result = value; break
     case "concat": {
       const pieces = args.map((_, index) => str(index))
       limitString(byteLength(value) + pieces.reduce((size, piece) => size + byteLength(piece), 0))
@@ -556,6 +658,35 @@ const invokeStringMethod = (value: string, name: string, args: Array<unknown>, n
     default: throw new InterpreterRuntimeError(`String method '${name}' is not available in Rune.`, node)
   }
   return boundedData(result, `String.${name} result`, node, limits)
+}
+
+const invokeNumberMethod = (value: number, name: string, args: Array<unknown>, node: AstNode, limits: ResolvedExecutionLimits): unknown => {
+  const optNum = (index: number): number | undefined => {
+    const arg = args[index]
+    if (arg === undefined) return undefined
+    if (typeof arg !== "number") throw new InterpreterRuntimeError(`Number.${name} expects a number argument.`, node)
+    return arg
+  }
+  let result: unknown
+  switch (name) {
+    case "toFixed": result = value.toFixed(optNum(0)); break
+    case "toExponential": result = value.toExponential(optNum(0)); break
+    case "toPrecision": {
+      const digits = optNum(0)
+      result = digits === undefined ? value.toString() : value.toPrecision(digits)
+      break
+    }
+    case "toString": {
+      const radix = optNum(0)
+      if (radix !== undefined && (radix < 2 || radix > 36)) {
+        throw new InterpreterRuntimeError("Number.toString radix must be between 2 and 36.", node)
+      }
+      result = value.toString(radix)
+      break
+    }
+    default: throw new InterpreterRuntimeError(`Number method '${name}' is not available in Rune.`, node)
+  }
+  return boundedData(result, `Number.${name} result`, node, limits)
 }
 
 // JavaScript's String(...) without tripping over Rune's null-prototype data objects.
@@ -602,6 +733,7 @@ const invokeObjectMethod = (name: string, args: Array<unknown>, node: AstNode, l
     case "keys": return Object.keys(requireObject())
     case "values": return Object.values(requireObject())
     case "entries": return Object.entries(requireObject()).map(([key, item]) => [key, item])
+    case "hasOwn": return Object.hasOwn(requireObject(), String(args[1]))
     case "assign": {
       const out: Record<string, unknown> = Object.create(null)
       for (const source of args) {
@@ -708,11 +840,69 @@ const invokeArrayStatic = (name: string, args: Array<unknown>, node: AstNode, li
   }
 }
 
+const invokeNumberStatic = (name: string, args: Array<unknown>, node: AstNode): unknown => {
+  const value = args[0]
+  switch (name) {
+    case "isInteger": return Number.isInteger(value)
+    case "isFinite": return Number.isFinite(value)
+    case "isNaN": return Number.isNaN(value)
+    case "isSafeInteger": return Number.isSafeInteger(value)
+    case "parseInt": {
+      const radix = args[1]
+      if (radix !== undefined && typeof radix !== "number") throw new InterpreterRuntimeError("Number.parseInt expects a numeric radix.", node)
+      return parseInt(coerceToString(value), radix)
+    }
+    case "parseFloat": return parseFloat(coerceToString(value))
+    default: throw new InterpreterRuntimeError(`Number.${name} is not available in Rune.`, node)
+  }
+}
+
+const invokeStringStatic = (name: string, args: Array<unknown>, node: AstNode): unknown => {
+  const codes = args.map((arg) => {
+    if (typeof arg !== "number") throw new InterpreterRuntimeError(`String.${name} expects number arguments.`, node)
+    return arg
+  })
+  switch (name) {
+    case "fromCharCode": return String.fromCharCode(...codes)
+    case "fromCodePoint": return String.fromCodePoint(...codes)
+    default: throw new InterpreterRuntimeError(`String.${name} is not available in Rune.`, node)
+  }
+}
+
 const invokeGlobalMethod = (ref: GlobalMethodReference, args: Array<unknown>, node: AstNode, limits: ResolvedExecutionLimits): unknown => {
   if (ref.namespace === "Object") return invokeObjectMethod(ref.name, args, node, limits)
   if (ref.namespace === "Math") return invokeMathMethod(ref.name, args, node)
   if (ref.namespace === "Array") return invokeArrayStatic(ref.name, args, node, limits)
+  if (ref.namespace === "Number") return invokeNumberStatic(ref.name, args, node)
+  if (ref.namespace === "String") return invokeStringStatic(ref.name, args, node)
   return invokeJsonMethod(ref.name, args, node, limits)
+}
+
+// Every identifier a parameter pattern binds, used to seed TDZ slots before defaults run.
+const collectPatternNames = (pattern: AstNode, out: Array<string> = []): Array<string> => {
+  switch (pattern.type) {
+    case "Identifier":
+      out.push(getString(pattern, "name"))
+      break
+    case "AssignmentPattern":
+      collectPatternNames(getNode(pattern, "left"), out)
+      break
+    case "RestElement":
+      collectPatternNames(getNode(pattern, "argument"), out)
+      break
+    case "ArrayPattern":
+      for (const element of getArray(pattern, "elements")) {
+        if (element !== null) collectPatternNames(asNode(element, "elements"), out)
+      }
+      break
+    case "ObjectPattern":
+      for (const property of getArray(pattern, "properties")) {
+        const prop = asNode(property, "properties")
+        collectPatternNames(prop.type === "RestElement" ? getNode(prop, "argument") : getNode(prop, "value"), out)
+      }
+      break
+  }
+  return out
 }
 
 class Interpreter<R> {
@@ -721,6 +911,12 @@ class Interpreter<R> {
   private readonly invokeTool: (path: ReadonlyArray<string>, args: Array<unknown>) => Effect.Effect<unknown, unknown, R>
   private readonly budget: { operations: number }
   private lastValue: unknown
+  // Cached byte size (and, for objects, key count) of each live container, maintained incrementally
+  // by the mutation helpers so appending in a loop is O(1)/op rather than re-walking the whole
+  // container each time (which made push/index-assign/key-assign loops O(n^2) — a CPU DoS). These
+  // are a fast path under the authoritative copyIn/copyOut boundary checks, never a replacement.
+  private readonly containerSizes = new WeakMap<object, number>()
+  private readonly objectCounts = new WeakMap<object, number>()
 
   constructor(
     limits: ResolvedExecutionLimits,
@@ -735,6 +931,7 @@ class Interpreter<R> {
     this.lastValue = undefined
     globalScope.set("tools", { mutable: false, value: new ToolReference([]) })
     globalScope.set("Promise", { mutable: false, value: new PromiseNamespace() })
+    globalScope.set("undefined", { mutable: false, value: undefined })
     globalScope.set("Object", { mutable: false, value: new GlobalNamespace("Object") })
     globalScope.set("Math", { mutable: false, value: new GlobalNamespace("Math") })
     globalScope.set("JSON", { mutable: false, value: new GlobalNamespace("JSON") })
@@ -748,7 +945,12 @@ class Interpreter<R> {
 
   run(program: ProgramNode): Effect.Effect<unknown, unknown, R> {
     const self = this
+    // Run the program body in its own module scope on top of the builtin global scope, so
+    // top-level declarations (`let undefined = 5`, `const Object = ...`) shadow builtins like
+    // JS module scope, instead of colliding with the seeded globals.
+    this.pushScope()
     return Effect.gen(function*() {
+      self.hoistFunctions(program.body)
       for (const statement of program.body) {
         const result = yield* self.evaluateStatement(statement)
 
@@ -766,7 +968,7 @@ class Interpreter<R> {
       }
 
       return self.lastValue
-    })
+    }).pipe(Effect.ensuring(Effect.sync(() => self.popScope())))
   }
 
   private evaluateStatement(node: AstNode): Effect.Effect<StatementResult, unknown, R> {
@@ -807,6 +1009,8 @@ class Interpreter<R> {
         return this.evaluateTryStatement(node)
       case "EmptyStatement":
         return Effect.succeed({ kind: "none" })
+      case "FunctionDeclaration":
+        return Effect.succeed({ kind: "none" }) // bound ahead of time by hoistFunctions
       default:
         throw unsupportedSyntax(node.type, node)
     }
@@ -817,6 +1021,7 @@ class Interpreter<R> {
     const self = this
     return Effect.gen(function*() {
       const body = getArray(node, "body")
+      self.hoistFunctions(body)
 
       for (const statementValue of body) {
         const statement = asNode(statementValue, "body")
@@ -834,6 +1039,27 @@ class Interpreter<R> {
 
       return { kind: "none" } satisfies StatementResult
     }).pipe(Effect.ensuring(Effect.sync(() => self.popScope())))
+  }
+
+  private createFunction(node: AstNode): RuneFunction {
+    if (node.generator === true) {
+      throw new InterpreterRuntimeError("Generator functions are not supported in Rune.", node, "UnsupportedSyntax", [supportedSyntaxMessage])
+    }
+    return new RuneFunction(
+      getArray(node, "params").map((parameter, index) => asNode(parameter, `params[${index}]`)),
+      getNode(node, "body"),
+      this.scopes.slice(),
+    )
+  }
+
+  // Function declarations are hoisted: bound in their scope before the body runs, so a
+  // program can call a helper defined further down (matching JavaScript).
+  private hoistFunctions(statements: Array<unknown>): void {
+    for (const statementValue of statements) {
+      if (!isRecord(statementValue) || statementValue.type !== "FunctionDeclaration") continue
+      const node = statementValue as AstNode
+      this.declare(getString(getNode(node, "id"), "name"), this.createFunction(node), true, node)
+    }
   }
 
   private evaluateIfStatement(node: AstNode): Effect.Effect<StatementResult, unknown, R> {
@@ -1048,7 +1274,7 @@ class Interpreter<R> {
       for (const value of right) {
         if (declaration) {
           self.pushScope()
-          self.declarePattern(declaration.pattern, value, declaration.mutable, left)
+          yield* self.declarePattern(declaration.pattern, value, declaration.mutable, left)
         } else if (assignmentName) {
           self.setIdentifierValue(assignmentName, value, left)
         }
@@ -1118,13 +1344,19 @@ class Interpreter<R> {
         }
 
         const thrown = Cause.squash(cause)
+        // The program sees a plain { message } error. Drop the interpreter's transpiled-source
+        // "(line N, col N)" suffix — those coordinates are internal and don't match the program.
         const caught = thrown instanceof ProgramThrow
           ? thrown.value
-          : Object.assign(Object.create(null) as SafeObject, { message: normalizeError(thrown).message })
+          : Object.assign(Object.create(null) as SafeObject, {
+              message: normalizeError(thrown).message.replace(/ \(line \d+, col \d+\)$/, ""),
+            })
         const parameter = getOptionalNode(handler, "param")
         self.pushScope()
-        if (parameter) self.declarePattern(parameter, caught, true, handler)
-        return self.evaluateStatement(getNode(handler, "body")).pipe(
+        return Effect.gen(function*() {
+          if (parameter) yield* self.declarePattern(parameter, caught, true, handler)
+          return yield* self.evaluateStatement(getNode(handler, "body"))
+        }).pipe(
           Effect.ensuring(Effect.sync(() => self.popScope())),
         )
       },
@@ -1162,52 +1394,80 @@ class Interpreter<R> {
 
         const init = getOptionalNode(declaration, "init")
         const value = init ? yield* self.evaluateExpression(init) : undefined
-        self.declarePattern(getNode(declaration, "id"), value, kind !== "const", declaration)
+        yield* self.declarePattern(getNode(declaration, "id"), value, kind !== "const", declaration)
       }
     })
   }
 
-  private declarePattern(pattern: AstNode, value: unknown, mutable: boolean, node: AstNode): void {
-    if (pattern.type === "Identifier") {
-      this.declare(getString(pattern, "name"), value, mutable, node)
-      return
-    }
-
-    if (pattern.type === "ObjectPattern") {
-      if (value === null || typeof value !== "object" || Array.isArray(value) || isRuntimeReference(value)) {
-        throw new InterpreterRuntimeError("Object destructuring requires a data object value.", pattern, "InvalidDataValue")
+  private declarePattern(pattern: AstNode, value: unknown, mutable: boolean, node: AstNode): Effect.Effect<void, unknown, R> {
+    const self = this
+    return Effect.gen(function*() {
+      if (pattern.type === "Identifier") {
+        self.declare(getString(pattern, "name"), value, mutable, node)
+        return
       }
 
-      for (const propertyValue of getArray(pattern, "properties")) {
-        const property = asNode(propertyValue, "properties")
-        if (property.type !== "Property" || getBoolean(property, "computed") || getString(property, "kind") !== "init") {
-          throw new InterpreterRuntimeError("Only named object destructuring properties are supported.", property)
+      // Default values: `x = expr` / `{ a = 1 }` — the default is evaluated only when the value is undefined.
+      if (pattern.type === "AssignmentPattern") {
+        const resolved = value === undefined ? yield* self.evaluateExpression(getNode(pattern, "right")) : value
+        yield* self.declarePattern(getNode(pattern, "left"), resolved, mutable, node)
+        return
+      }
+
+      if (pattern.type === "ObjectPattern") {
+        if (value === null || typeof value !== "object" || Array.isArray(value) || isRuntimeReference(value)) {
+          throw new InterpreterRuntimeError("Object destructuring requires a data object value.", pattern, "InvalidDataValue")
         }
 
-        const keyNode = getNode(property, "key")
-        const key = keyNode.type === "Identifier" ? getString(keyNode, "name") : String(keyNode.value)
-        if (isBlockedMember(key)) {
-          throw new InterpreterRuntimeError(`Property '${key}' is not available in Rune.`, keyNode)
+        const consumed = new Set<string>()
+        for (const propertyValue of getArray(pattern, "properties")) {
+          const property = asNode(propertyValue, "properties")
+
+          // Object rest: `{ a, ...others }` — gather the not-yet-consumed own keys.
+          if (property.type === "RestElement") {
+            const rest: SafeObject = Object.create(null) as SafeObject
+            for (const [key, item] of Object.entries(value as SafeObject)) {
+              if (!consumed.has(key) && !isBlockedMember(key)) rest[key] = item
+            }
+            yield* self.declarePattern(getNode(property, "argument"), rest, mutable, property)
+            continue
+          }
+
+          if (property.type !== "Property" || getBoolean(property, "computed") || getString(property, "kind") !== "init") {
+            throw new InterpreterRuntimeError("Only named object destructuring properties are supported.", property)
+          }
+
+          const keyNode = getNode(property, "key")
+          const key = keyNode.type === "Identifier" ? getString(keyNode, "name") : String(keyNode.value)
+          if (isBlockedMember(key)) {
+            throw new InterpreterRuntimeError(`Property '${key}' is not available in Rune.`, keyNode)
+          }
+          consumed.add(key)
+          yield* self.declarePattern(getNode(property, "value"), (value as SafeObject)[key], mutable, property)
         }
-        this.declarePattern(getNode(property, "value"), (value as SafeObject)[key], mutable, property)
-      }
-      return
-    }
-
-    if (pattern.type === "ArrayPattern") {
-      if (!Array.isArray(value)) {
-        throw new InterpreterRuntimeError("Array destructuring requires an array value.", pattern)
+        return
       }
 
-      for (const [index, item] of getArray(pattern, "elements").entries()) {
-        if (item !== null) {
-          this.declarePattern(asNode(item, `elements[${index}]`), value[index], mutable, pattern)
+      if (pattern.type === "ArrayPattern") {
+        if (!Array.isArray(value)) {
+          throw new InterpreterRuntimeError("Array destructuring requires an array value.", pattern)
         }
-      }
-      return
-    }
 
-    throw new InterpreterRuntimeError(`Unsupported binding pattern '${pattern.type}'.`, pattern)
+        for (const [index, item] of getArray(pattern, "elements").entries()) {
+          if (item === null) continue
+          const element = asNode(item, `elements[${index}]`)
+          // Array rest: `[head, ...tail]` — binds the remaining elements (must be last).
+          if (element.type === "RestElement") {
+            yield* self.declarePattern(getNode(element, "argument"), value.slice(index), mutable, element)
+            break
+          }
+          yield* self.declarePattern(element, value[index], mutable, pattern)
+        }
+        return
+      }
+
+      throw new InterpreterRuntimeError(`Unsupported binding pattern '${pattern.type}'.`, pattern)
+    })
   }
 
   private evaluateExpression(node: AstNode): Effect.Effect<unknown, unknown, R> {
@@ -1229,11 +1489,8 @@ class Interpreter<R> {
       case "CallExpression":
         return this.evaluateCallExpression(node)
       case "ArrowFunctionExpression":
-        return Effect.sync(() => new RuneFunction(
-          getArray(node, "params").map((parameter, index) => asNode(parameter, `params[${index}]`)),
-          getNode(node, "body"),
-          this.scopes.slice(),
-        ))
+      case "FunctionExpression":
+        return Effect.sync(() => this.createFunction(node))
       case "MemberExpression":
         return this.readMember(node)
       case "ChainExpression":
@@ -1252,9 +1509,29 @@ class Interpreter<R> {
       case "AwaitExpression": {
         return this.evaluateExpression(getNode(node, "argument"))
       }
+      case "NewExpression":
+        return this.evaluateNewExpression(node)
       default:
         throw unsupportedSyntax(node.type, node)
     }
+  }
+
+  private evaluateNewExpression(node: AstNode): Effect.Effect<unknown, unknown, R> {
+    const callee = getNode(node, "callee")
+    if (callee.type !== "Identifier" || !errorConstructors.has(getString(callee, "name"))) {
+      throw unsupportedSyntax("NewExpression", node)
+    }
+    const name = getString(callee, "name")
+    const argNodes = getArray(node, "arguments")
+    const self = this
+    return Effect.gen(function*() {
+      const arg = argNodes.length > 0 ? yield* self.evaluateExpression(asNode(argNodes[0], "arguments[0]")) : undefined
+      const message = arg === undefined ? "" : coerceToString(arg)
+      const errorValue: SafeObject = Object.create(null) as SafeObject
+      errorValue.name = name
+      errorValue.message = message
+      return errorValue
+    })
   }
 
   private evaluateBinaryExpression(node: AstNode): Effect.Effect<unknown, unknown, R> {
@@ -1266,22 +1543,44 @@ class Interpreter<R> {
       if (containsRuntimeReference(lhs) || containsRuntimeReference(rhs)) {
         throw new InterpreterRuntimeError("Binary operators require data values in Rune.", node, "InvalidDataValue")
       }
+      // Data objects/arrays are null-prototype, so JS's ToPrimitive throws an opaque host
+      // "No default value" TypeError when an operator coerces them. Coerce to their JS string
+      // form first (as String(x) / template literals do) so operators behave like JavaScript.
+      // Identity (=== / !==) and the right operand of `in` keep their raw object value.
+      const coerceOperand = (operand: unknown): unknown =>
+        operand !== null && typeof operand === "object" ? coerceToString(operand) : operand
+      const bothObjects = lhs !== null && typeof lhs === "object" && rhs !== null && typeof rhs === "object"
+      const l = coerceOperand(lhs) as any
+      const r = coerceOperand(rhs) as any
       let result: unknown
       switch (operator) {
-        case "+": result = lhs + rhs; break
-        case "-": result = lhs - rhs; break
-        case "*": result = lhs * rhs; break
-        case "/": result = lhs / rhs; break
-        case "%": result = lhs % rhs; break
-        case "**": result = lhs ** rhs; break
-        case "==": result = lhs == rhs; break
+        case "+": result = l + r; break
+        case "-": result = l - r; break
+        case "*": result = l * r; break
+        case "/": result = l / r; break
+        case "%": result = l % r; break
+        case "**": result = l ** r; break
+        // Two objects compare by identity in JS (no ToPrimitive); only object-vs-primitive coerces.
+        case "==": result = bothObjects ? lhs === rhs : l == r; break
         case "===": result = lhs === rhs; break
-        case "!=": result = lhs != rhs; break
+        case "!=": result = bothObjects ? lhs !== rhs : l != r; break
         case "!==": result = lhs !== rhs; break
-        case "<": result = lhs < rhs; break
-        case "<=": result = lhs <= rhs; break
-        case ">": result = lhs > rhs; break
-        case ">=": result = lhs >= rhs; break
+        case "<": result = l < r; break
+        case "<=": result = l <= r; break
+        case ">": result = l > r; break
+        case ">=": result = l >= r; break
+        case "&": result = l & r; break
+        case "|": result = l | r; break
+        case "^": result = l ^ r; break
+        case "<<": result = l << r; break
+        case ">>": result = l >> r; break
+        case ">>>": result = l >>> r; break
+        case "in":
+          if (rhs === null || typeof rhs !== "object") {
+            throw new InterpreterRuntimeError("The 'in' operator requires a data object on the right-hand side.", node)
+          }
+          // Own properties only, so arrays don't leak the host Array.prototype (map/constructor/...).
+          result = Object.hasOwn(rhs as object, coerceOperand(lhs) as PropertyKey); break
         default: throw new InterpreterRuntimeError(`Unsupported binary operator '${operator}'.`, node)
       }
       return boundedData(result, "Binary expression result", node, self.limits)
@@ -1305,12 +1604,20 @@ class Interpreter<R> {
         throw new InterpreterRuntimeError("Unary operators require data values in Rune.", node, "InvalidDataValue")
       }
       const rhs = value as any
+      // Numeric/bitwise unary operators ToPrimitive their operand; coerce null-prototype
+      // data objects/arrays to their JS string form first (see evaluateBinaryExpression).
+      // `!` and `typeof` operate on the raw value (no ToPrimitive, no crash).
+      const operand =
+        (operator === "+" || operator === "-" || operator === "~") && rhs !== null && typeof rhs === "object"
+          ? (coerceToString(rhs) as any)
+          : rhs
       let result: unknown
       switch (operator) {
-        case "+": result = +rhs; break
-        case "-": result = -rhs; break
+        case "+": result = +operand; break
+        case "-": result = -operand; break
         case "!": result = !rhs; break
         case "typeof": result = typeof rhs; break
+        case "~": result = ~operand; break
         default: throw new InterpreterRuntimeError(`Unsupported unary operator '${operator}'.`, node)
       }
       return boundedData(result, "Unary expression result", node, this.limits)
@@ -1322,6 +1629,9 @@ class Interpreter<R> {
     const operator = getString(node, "operator")
     const self = this
     return Effect.gen(function*() {
+      if (operator === "??=" || operator === "||=" || operator === "&&=") {
+        return yield* self.evaluateLogicalAssignment(node, left, operator)
+      }
       const rightValue = yield* self.evaluateExpression(getNode(node, "right"))
       if (left.type === "Identifier") {
         const name = getString(left, "name")
@@ -1333,11 +1643,34 @@ class Interpreter<R> {
         if (operator === "=") return yield* self.writeMember(left, rightValue)
         return yield* self.modifyMember(left, (current) => {
           const next = boundedData(self.applyCompoundAssignment(operator, current, rightValue, node), "Assignment result", node, self.limits)
-          return { next, result: next }
+          return Effect.succeed({ write: true, next, result: next })
         })
       }
       throw new InterpreterRuntimeError("Assignment target must be an Identifier or MemberExpression.", left)
     })
+  }
+
+  private evaluateLogicalAssignment(node: AstNode, left: AstNode, operator: string): Effect.Effect<unknown, unknown, R> {
+    const self = this
+    const shouldAssign = (current: unknown): boolean =>
+      operator === "??=" ? current === null || current === undefined : operator === "||=" ? !current : Boolean(current)
+    if (left.type === "Identifier") {
+      const name = getString(left, "name")
+      return Effect.gen(function*() {
+        const current = self.getIdentifierValue(name, left)
+        if (!shouldAssign(current)) return current
+        const rightValue = yield* self.evaluateExpression(getNode(node, "right"))
+        return self.setIdentifierValue(name, rightValue, left)
+      })
+    }
+    if (left.type === "MemberExpression") {
+      // Resolve the member exactly once; evaluate the RHS only if we actually assign.
+      return self.modifyMember(left, (current) =>
+        shouldAssign(current)
+          ? Effect.map(self.evaluateExpression(getNode(node, "right")), (rightValue) => ({ write: true, next: rightValue, result: rightValue }))
+          : Effect.succeed({ write: false, next: current, result: current }))
+    }
+    throw new InterpreterRuntimeError("Assignment target must be an Identifier or MemberExpression.", left)
   }
 
   private evaluateUpdateExpression(node: AstNode): Effect.Effect<unknown, unknown, R> {
@@ -1365,7 +1698,7 @@ class Interpreter<R> {
       return this.modifyMember(argument, (current) => {
         const value = Number(current)
         const next = boundedData(value + increment, "Update result", node, this.limits) as number
-        return { next, result: prefix ? next : value }
+        return Effect.succeed({ write: true, next, result: prefix ? next : value })
       })
     }
 
@@ -1402,10 +1735,14 @@ class Interpreter<R> {
         return yield* self.invokeIntrinsic(callable, args, node)
       }
       if (callable instanceof GlobalMethodReference) {
-        return boundedData(invokeGlobalMethod(callable, args, node, self.limits), `${callable.namespace}.${callable.name} result`, node, self.limits)
+        const globalResult = invokeGlobalMethod(callable, args, node, self.limits)
+        self.recordWork(workUnits(globalResult), node)
+        return boundedData(globalResult, `${callable.namespace}.${callable.name} result`, node, self.limits)
       }
       if (callable instanceof CoercionFunction) {
-        return boundedData(invokeCoercion(callable, args, node, self.limits), `${callable.name} result`, node, self.limits)
+        const coercionResult = invokeCoercion(callable, args, node, self.limits)
+        self.recordWork(workUnits(coercionResult), node)
+        return boundedData(coercionResult, `${callable.name} result`, node, self.limits)
       }
       throw new InterpreterRuntimeError("Only tool capabilities are callable in Rune.", callee)
     })
@@ -1419,11 +1756,13 @@ class Interpreter<R> {
         const argNode = asNode(arg, `arguments[${index}]`)
         if (argNode.type === "SpreadElement") {
           const spread = yield* self.evaluateExpression(getNode(argNode, "argument"))
-          if (!Array.isArray(spread)) throw new InterpreterRuntimeError("Spread arguments require an array in Rune.", argNode)
-          if (args.length + spread.length > self.limits.maxCollectionLength) {
+          const items = Array.isArray(spread) ? spread : typeof spread === "string" ? Array.from(spread) : undefined
+          if (items === undefined) throw new InterpreterRuntimeError("Spread arguments require an array or string in Rune.", argNode)
+          if (args.length + items.length > self.limits.maxCollectionLength) {
             throw new InterpreterRuntimeError(`Call arguments exceed the maximum collection length of ${self.limits.maxCollectionLength}.`, argNode, "InvalidDataValue")
           }
-          args.push(...spread)
+          args.push(...items)
+          self.recordWork(items.length, argNode)
         } else {
           args.push(yield* self.evaluateExpression(argNode))
           if (args.length > self.limits.maxCollectionLength) {
@@ -1523,8 +1862,21 @@ class Interpreter<R> {
       const savedScopes = self.scopes
       self.scopes = [...fn.capturedScopes, new Map<string, Binding>()]
       const run = Effect.gen(function*() {
+        // Seed every parameter name into the scope as a TDZ slot first, so a default that
+        // references another parameter resolves to that (uninitialized) param rather than
+        // silently falling through to an outer binding of the same name — matching JS.
+        const paramScope = self.currentScope()
+        for (const parameter of fn.parameters) {
+          for (const name of collectPatternNames(parameter)) {
+            paramScope.set(name, { mutable: true, value: undefined, initialized: false })
+          }
+        }
         for (const [index, parameter] of fn.parameters.entries()) {
-          self.declarePattern(parameter, args[index], true, parameter)
+          if (parameter.type === "RestElement") {
+            yield* self.declarePattern(getNode(parameter, "argument"), args.slice(index), true, parameter)
+            break
+          }
+          yield* self.declarePattern(parameter, args[index], true, parameter)
         }
 
         if (fn.body.type === "BlockStatement") {
@@ -1540,10 +1892,21 @@ class Interpreter<R> {
 
   private invokeIntrinsic(ref: IntrinsicReference, args: Array<unknown>, node: AstNode): Effect.Effect<unknown, unknown, R> {
     if (typeof ref.receiver === "string") {
-      return Effect.succeed(invokeStringMethod(ref.receiver, ref.name, args, node, this.limits))
+      this.recordWork(ref.receiver.length, node)
+      const result = invokeStringMethod(ref.receiver, ref.name, args, node, this.limits)
+      if (typeof result === "string") this.recordWork(result.length, node)
+      return Effect.succeed(result)
+    }
+    if (typeof ref.receiver === "number") {
+      return Effect.succeed(invokeNumberMethod(ref.receiver, ref.name, args, node, this.limits))
     }
     if (Array.isArray(ref.receiver)) {
-      return this.invokeArrayMethod(ref.receiver, ref.name, args, node)
+      if (!cheapArrayMethods.has(ref.name)) this.recordWork(ref.receiver.length, node)
+      const self = this
+      return Effect.map(this.invokeArrayMethod(ref.receiver, ref.name, args, node), (result) => {
+        if (Array.isArray(result)) self.recordWork(result.length, node)
+        return result
+      })
     }
     throw new InterpreterRuntimeError(`Method '${ref.name}' is not available in Rune.`, node)
   }
@@ -1586,7 +1949,49 @@ class Interpreter<R> {
       case "reverse":
         return Effect.succeed(boundedCollection([...target].reverse()))
       case "sort":
+      case "toSorted":
         return this.sortArray(target, args[0], node)
+      case "toReversed":
+        return Effect.succeed(boundedCollection([...target].reverse()))
+      case "with": {
+        const index = optNumber(args[0], "index") ?? 0
+        return Effect.succeed(boundedCollection(target.with(index, args[1])))
+      }
+      case "push": {
+        if (target.length + args.length > this.limits.maxCollectionLength) {
+          throw new InterpreterRuntimeError(`Array.push exceeds the maximum collection length of ${this.limits.maxCollectionLength}.`, node, "InvalidDataValue")
+        }
+        // Validate before mutating (so no rollback is needed) and charge only the new elements,
+        // keeping a push loop O(1)/element instead of re-walking the whole array each call.
+        let added = 0
+        for (const item of args) {
+          this.rejectCircularInsertion(target, item, "Array.push result", node)
+          added += this.nestedValueBytes(item, "Array.push result", node) + 1
+        }
+        this.growContainerBytes(target, added, node, "Array.push result")
+        target.push(...args)
+        return Effect.succeed(target.length)
+      }
+      case "unshift": {
+        if (target.length + args.length > this.limits.maxCollectionLength) {
+          throw new InterpreterRuntimeError(`Array.unshift exceeds the maximum collection length of ${this.limits.maxCollectionLength}.`, node, "InvalidDataValue")
+        }
+        let added = 0
+        for (const item of args) {
+          this.rejectCircularInsertion(target, item, "Array.unshift result", node)
+          added += this.nestedValueBytes(item, "Array.unshift result", node) + 1
+        }
+        this.growContainerBytes(target, added, node, "Array.unshift result")
+        target.unshift(...args)
+        return Effect.succeed(target.length)
+      }
+      // Removals only shrink the array; drop the cached size so the next growth recomputes it.
+      case "pop":
+        this.containerSizes.delete(target)
+        return Effect.succeed(target.pop())
+      case "shift":
+        this.containerSizes.delete(target)
+        return Effect.succeed(target.shift())
     }
 
     const callback = args[0]
@@ -1595,16 +2000,19 @@ class Interpreter<R> {
     }
     const self = this
     return Effect.gen(function*() {
+      // Iterate a snapshot taken at call time so a callback that mutates the array can't
+      // self-extend the loop — matching JS, where elements appended during iteration are not visited.
+      const items = target.slice()
       switch (name) {
         case "map": {
           const values: Array<unknown> = []
-          for (const [index, item] of target.entries()) values.push(yield* self.invokeFunction(callback, [item, index]))
+          for (const [index, item] of items.entries()) values.push(yield* self.invokeFunction(callback, [item, index, items]))
           return boundedCollection(values)
         }
         case "flatMap": {
           const values: Array<unknown> = []
-          for (const [index, item] of target.entries()) {
-            const mapped = yield* self.invokeFunction(callback, [item, index])
+          for (const [index, item] of items.entries()) {
+            const mapped = yield* self.invokeFunction(callback, [item, index, items])
             if (Array.isArray(mapped)) values.push(...mapped)
             else values.push(mapped)
             boundedCollection(values)
@@ -1613,33 +2021,33 @@ class Interpreter<R> {
         }
         case "filter": {
           const values: Array<unknown> = []
-          for (const [index, item] of target.entries()) {
-            if (yield* self.invokeFunction(callback, [item, index])) values.push(item)
+          for (const [index, item] of items.entries()) {
+            if (yield* self.invokeFunction(callback, [item, index, items])) values.push(item)
           }
           return boundedCollection(values)
         }
         case "find":
-          for (const [index, item] of target.entries()) {
-            if (yield* self.invokeFunction(callback, [item, index])) return item
+          for (const [index, item] of items.entries()) {
+            if (yield* self.invokeFunction(callback, [item, index, items])) return item
           }
           return undefined
         case "findIndex":
-          for (const [index, item] of target.entries()) {
-            if (yield* self.invokeFunction(callback, [item, index])) return index
+          for (const [index, item] of items.entries()) {
+            if (yield* self.invokeFunction(callback, [item, index, items])) return index
           }
           return -1
         case "some":
-          for (const [index, item] of target.entries()) {
-            if (yield* self.invokeFunction(callback, [item, index])) return true
+          for (const [index, item] of items.entries()) {
+            if (yield* self.invokeFunction(callback, [item, index, items])) return true
           }
           return false
         case "every":
-          for (const [index, item] of target.entries()) {
-            if (!(yield* self.invokeFunction(callback, [item, index]))) return false
+          for (const [index, item] of items.entries()) {
+            if (!(yield* self.invokeFunction(callback, [item, index, items]))) return false
           }
           return true
         case "forEach":
-          for (const [index, item] of target.entries()) yield* self.invokeFunction(callback, [item, index])
+          for (const [index, item] of items.entries()) yield* self.invokeFunction(callback, [item, index, items])
           return undefined
         case "reduce": {
           let accumulator: unknown
@@ -1648,15 +2056,41 @@ class Interpreter<R> {
             accumulator = args[1]
             start = 0
           } else {
-            if (target.length === 0) throw new InterpreterRuntimeError("Array.reduce of an empty array with no initial value.", node)
-            accumulator = target[0]
+            if (items.length === 0) throw new InterpreterRuntimeError("Array.reduce of an empty array with no initial value.", node)
+            accumulator = items[0]
             start = 1
           }
-          for (let index = start; index < target.length; index += 1) {
-            accumulator = yield* self.invokeFunction(callback, [accumulator, target[index], index])
+          for (let index = start; index < items.length; index += 1) {
+            accumulator = yield* self.invokeFunction(callback, [accumulator, items[index], index, items])
           }
           return accumulator
         }
+        case "reduceRight": {
+          let accumulator: unknown
+          let start: number
+          if (args.length >= 2) {
+            accumulator = args[1]
+            start = items.length - 1
+          } else {
+            if (items.length === 0) throw new InterpreterRuntimeError("Array.reduceRight of an empty array with no initial value.", node)
+            accumulator = items[items.length - 1]
+            start = items.length - 2
+          }
+          for (let index = start; index >= 0; index -= 1) {
+            accumulator = yield* self.invokeFunction(callback, [accumulator, items[index], index, items])
+          }
+          return accumulator
+        }
+        case "findLast":
+          for (let index = items.length - 1; index >= 0; index -= 1) {
+            if (yield* self.invokeFunction(callback, [items[index], index, items])) return items[index]
+          }
+          return undefined
+        case "findLastIndex":
+          for (let index = items.length - 1; index >= 0; index -= 1) {
+            if (yield* self.invokeFunction(callback, [items[index], index, items])) return index
+          }
+          return -1
       }
       throw new InterpreterRuntimeError(`Array method '${name}' is not available in Rune.`, node)
     })
@@ -1696,8 +2130,11 @@ class Interpreter<R> {
         return [...merged, ...left.slice(leftIndex), ...right.slice(rightIndex)]
       })
     }
-    return Effect.map(mergeSort([...target]), (items) =>
-      boundedProgramValue(items, "Array.sort result", node, this.limits) as Array<unknown>)
+    // Per spec, undefined elements sort to the end and the comparator is never called on them.
+    const defined = target.filter((item) => item !== undefined)
+    const undefinedCount = target.length - defined.length
+    return Effect.map(mergeSort(defined), (items) =>
+      boundedProgramValue([...items, ...Array(undefinedCount).fill(undefined)], "Array.sort result", node, this.limits) as Array<unknown>)
   }
 
   private evaluateObjectExpression(node: AstNode): Effect.Effect<Record<string, unknown>, unknown, R> {
@@ -1780,8 +2217,10 @@ class Interpreter<R> {
         const element = asNode(elementValue, "elements")
         if (element.type === "SpreadElement") {
           const spread = yield* self.evaluateExpression(getNode(element, "argument"))
-          if (!Array.isArray(spread)) throw new InterpreterRuntimeError("Array spread requires an array in Rune.", element)
-          values.push(...spread)
+          const items = Array.isArray(spread) ? spread : typeof spread === "string" ? Array.from(spread) : undefined
+          if (items === undefined) throw new InterpreterRuntimeError("Array spread requires an array or string in Rune.", element)
+          values.push(...items)
+          self.recordWork(items.length, element)
         } else {
           values.push(yield* self.evaluateExpression(element))
         }
@@ -1850,6 +2289,18 @@ class Interpreter<R> {
         return lhs % rhs
       case "**=":
         return lhs ** rhs
+      case "&=":
+        return lhs & rhs
+      case "|=":
+        return lhs | rhs
+      case "^=":
+        return lhs ^ rhs
+      case "<<=":
+        return lhs << rhs
+      case ">>=":
+        return lhs >> rhs
+      case ">>>=":
+        return lhs >>> rhs
       default:
         throw new InterpreterRuntimeError(`Unsupported assignment operator '${operator}'.`, node)
     }
@@ -1900,6 +2351,20 @@ class Interpreter<R> {
         if (typeof key === "string" && /^\d+$/.test(key)) return new ComputedValue(objectValue[Number(key)])
         if (typeof key === "string" && stringMethods.has(key)) return new IntrinsicReference(objectValue, key)
         throw new InterpreterRuntimeError(`String property '${String(key)}' is not available in Rune.`, propertyNode)
+      }
+
+      if (typeof objectValue === "number") {
+        if (typeof key === "string" && numberMethods.has(key)) return new IntrinsicReference(objectValue, key)
+        throw new InterpreterRuntimeError(`Number property '${String(key)}' is not available in Rune.`, propertyNode)
+      }
+
+      // Number / String expose a small allowlist of statics; everything else stays opaque.
+      if (objectValue instanceof CoercionFunction && typeof key === "string" && !isBlockedMember(key)) {
+        if (objectValue.name === "Number" && numberConstants.has(key)) {
+          return new ComputedValue((Number as unknown as Record<string, number>)[key])
+        }
+        if (objectValue.name === "Number" && numberStatics.has(key)) return new GlobalMethodReference("Number", key)
+        if (objectValue.name === "String" && stringStatics.has(key)) return new GlobalMethodReference("String", key)
       }
 
       if (isRuntimeReference(objectValue)) {
@@ -1955,14 +2420,19 @@ class Interpreter<R> {
   }
 
   private writeMember(node: AstNode, value: unknown): Effect.Effect<unknown, unknown, R> {
-    return this.modifyMember(node, () => ({ next: value, result: value }))
+    return this.modifyMember(node, () => Effect.succeed({ write: true, next: value, result: value }))
   }
 
+  // Resolves the member reference EXACTLY ONCE (so a side-effecting object/key expression
+  // runs once), then lets `compute` decide whether to write — enabling compound assignment,
+  // updates, plain writes, and short-circuiting logical assignment to share one safe path.
   private modifyMember(
     node: AstNode,
-    compute: (current: unknown) => { next: unknown; result: unknown },
+    compute: (current: unknown) => Effect.Effect<{ write: boolean; next: unknown; result: unknown }, unknown, R>,
   ): Effect.Effect<unknown, unknown, R> {
-    return Effect.map(this.getMemberReference(node), (reference) => {
+    const self = this
+    return Effect.gen(function*() {
+      const reference = yield* self.getMemberReference(node)
       if (
         reference === OptionalShortCircuit ||
         reference instanceof ComputedValue ||
@@ -1979,44 +2449,111 @@ class Interpreter<R> {
         if (typeof reference.key === "string" && arrayMethods.has(reference.key)) {
           throw new InterpreterRuntimeError("Array methods cannot be assigned in Rune.", node)
         }
-        const index = Number(reference.key)
-        if (!Number.isInteger(index) || index < 0 || index >= this.limits.maxCollectionLength) {
-          throw new InterpreterRuntimeError(`Array assignment index must be between 0 and ${this.limits.maxCollectionLength - 1}.`, node, "InvalidDataValue")
-        }
-        const { next, result } = compute(reference.target[index])
-        const previous = reference.target[index]
-        const existed = Object.hasOwn(reference.target, index)
-        const previousLength = reference.target.length
-        reference.target[index] = next
-        try {
-          boundedProgramValue(reference.target, "Array assignment result", node, this.limits)
-        } catch (error) {
-          if (existed) reference.target[index] = previous
-          else {
-            delete reference.target[index]
-            reference.target.length = previousLength
-          }
-          throw error
-        }
-        return result
       }
-      const key = String(reference.key)
-      if (!Object.hasOwn(reference.target, key) && Object.keys(reference.target).length >= this.limits.maxCollectionLength) {
-        throw new InterpreterRuntimeError(`Object assignment exceeds the maximum collection length of ${this.limits.maxCollectionLength}.`, node, "InvalidDataValue")
-      }
-      const { next, result } = compute(reference.target[key])
-      const previous = reference.target[key]
-      const existed = Object.hasOwn(reference.target, key)
-      reference.target[key] = next
-      try {
-        boundedProgramValue(reference.target, "Object assignment result", node, this.limits)
-      } catch (error) {
-        if (existed) reference.target[key] = previous
-        else delete reference.target[key]
-        throw error
-      }
+      const key = Array.isArray(reference.target) ? Number(reference.key) : String(reference.key)
+      const current = (reference.target as Record<PropertyKey, unknown>)[key]
+      const { write, next, result } = yield* compute(current)
+      if (write) self.assignToReference(reference, key, next, node)
       return result
     })
+  }
+
+  // Writes `next` to a resolved member, enforcing index/capacity/byte limits and rolling
+  // back the mutation if the bound is exceeded (so a caught error can't leave it grown).
+  // Byte size of a container, cached after the first walk and maintained incrementally by the
+  // mutation helpers. O(1) on a cache hit; O(container) once on the first touch.
+  private cachedContainerBytes(container: object, node: AstNode): number {
+    const cached = this.containerSizes.get(container)
+    if (cached !== undefined) return cached
+    const bytes = runtimeValueBytes(container, "value", node, this.limits)
+    this.recordWork(workUnits(container), node)
+    this.containerSizes.set(container, bytes)
+    return bytes
+  }
+
+  // Bytes a value contributes when nested one level inside a container; also enforces that the
+  // nested value's depth stays within maxValueDepth. O(value), independent of the container size.
+  private nestedValueBytes(value: unknown, label: string, node: AstNode): number {
+    return runtimeValueBytes(value, label, node, this.limits, 1)
+  }
+
+  private rejectCircularInsertion(container: object, value: unknown, label: string, node: AstNode, seen = new Set<object>()): void {
+    if (value === container) throw new InterpreterRuntimeError(`${label} contains a circular value.`, node, "InvalidDataValue")
+    if (value === null || typeof value !== "object" || isRuntimeReference(value) || seen.has(value)) return
+    seen.add(value)
+    const items = Array.isArray(value) ? value : Object.values(value)
+    for (const item of items) this.rejectCircularInsertion(container, item, label, node, seen)
+    seen.delete(value)
+  }
+
+  // Add `addedBytes` of new entries to a container, rejecting (before any mutation) if that would
+  // exceed maxDataBytes, then record the container's new cached size.
+  private growContainerBytes(container: object, addedBytes: number, node: AstNode, label: string): void {
+    const next = this.cachedContainerBytes(container, node) + addedBytes
+    if (next > this.limits.maxDataBytes) {
+      throw new InterpreterRuntimeError(`${label} exceeds the maximum data size of ${this.limits.maxDataBytes} bytes.`, node, "InvalidDataValue")
+    }
+    this.containerSizes.set(container, next)
+  }
+
+  private assignToReference(reference: MemberReference, key: number | string, next: unknown, node: AstNode): void {
+    if (Array.isArray(reference.target)) {
+      const target = reference.target
+      const index = key as number
+      if (!Number.isInteger(index) || index < 0 || index >= this.limits.maxCollectionLength) {
+        throw new InterpreterRuntimeError(`Array assignment index must be between 0 and ${this.limits.maxCollectionLength - 1}.`, node, "InvalidDataValue")
+      }
+      this.rejectCircularInsertion(target, next, "Array assignment result", node)
+      const addedBytes = this.nestedValueBytes(next, "Array assignment result", node)
+      if (index === target.length) {
+        // Append — the hot path; O(1) incremental size update (this is the O(n^2)-loop fix).
+        this.growContainerBytes(target, addedBytes + 1, node, "Array assignment result")
+        target[index] = next
+      } else if (index < target.length) {
+        // Replace an existing slot (value or hole): adjust by the byte delta.
+        const oldBytes = this.nestedValueBytes(target[index], "Array assignment result", node)
+        const nextSize = this.cachedContainerBytes(target, node) + addedBytes - oldBytes
+        if (nextSize > this.limits.maxDataBytes) {
+          throw new InterpreterRuntimeError(`Array assignment result exceeds the maximum data size of ${this.limits.maxDataBytes} bytes.`, node, "InvalidDataValue")
+        }
+        this.containerSizes.set(target, nextSize)
+        target[index] = next
+      } else {
+        // index > length introduces holes; fall back to a full revalidation and reset the cache.
+        const previousLength = target.length
+        target[index] = next
+        try {
+          boundedProgramValue(target, "Array assignment result", node, this.limits)
+          this.containerSizes.set(target, runtimeValueBytes(target, "value", node, this.limits))
+        } catch (error) {
+          delete target[index]
+          target.length = previousLength
+          throw error
+        }
+      }
+      return
+    }
+    const target = reference.target as SafeObject
+    const objectKey = key as string
+    this.rejectCircularInsertion(target, next, "Object assignment result", node)
+    const addedBytes = this.nestedValueBytes(next, "Object assignment result", node)
+    if (Object.hasOwn(target, objectKey)) {
+      const oldBytes = this.nestedValueBytes(target[objectKey], "Object assignment result", node)
+      const nextSize = this.cachedContainerBytes(target, node) + addedBytes - oldBytes
+      if (nextSize > this.limits.maxDataBytes) {
+        throw new InterpreterRuntimeError(`Object assignment result exceeds the maximum data size of ${this.limits.maxDataBytes} bytes.`, node, "InvalidDataValue")
+      }
+      this.containerSizes.set(target, nextSize)
+      target[objectKey] = next
+      return
+    }
+    const count = (this.objectCounts.get(target) ?? Object.keys(target).length) + 1
+    if (count > this.limits.maxCollectionLength) {
+      throw new InterpreterRuntimeError(`Object assignment exceeds the maximum collection length of ${this.limits.maxCollectionLength}.`, node, "InvalidDataValue")
+    }
+    this.growContainerBytes(target, dataByteLength(objectKey) + addedBytes + 1, node, "Object assignment result")
+    this.objectCounts.set(target, count)
+    target[objectKey] = next
   }
 
   private toPropertyKey(value: unknown, node: AstNode): string | number {
@@ -2030,11 +2567,14 @@ class Interpreter<R> {
   private declare(name: string, value: unknown, mutable: boolean, node: AstNode): void {
     const scope = this.currentScope()
 
-    if (scope.has(name)) {
+    // A pre-seeded parameter slot (initialized === false) is being bound for the first time;
+    // anything else already present is a genuine duplicate declaration.
+    const existing = scope.get(name)
+    if (existing && existing.initialized !== false) {
       throw new InterpreterRuntimeError(`Identifier '${name}' has already been declared.`, node)
     }
 
-    scope.set(name, { mutable, value })
+    scope.set(name, { mutable, value, initialized: true })
   }
 
   private getIdentifierValue(name: string, node: AstNode): unknown {
@@ -2042,6 +2582,11 @@ class Interpreter<R> {
 
     if (!binding) {
       throw new InterpreterRuntimeError(`Unknown identifier '${name}'.`, node)
+    }
+
+    // A parameter default that forward-references a later (not-yet-bound) parameter — JS TDZ.
+    if (binding.initialized === false) {
+      throw new InterpreterRuntimeError(`Cannot access '${name}' before initialization.`, node)
     }
 
     return binding.value
@@ -2104,7 +2649,13 @@ class Interpreter<R> {
   }
 
   private recordOperation(node: AstNode): void {
-    this.budget.operations += 1
+    this.recordWork(1, node)
+  }
+
+  // Charge `units` of work to the operation budget so O(n) built-ins (collection/string
+  // walks and spreads) are bounded by maxOperations, not only by the wall-clock timeout.
+  private recordWork(units: number, node?: AstNode): void {
+    this.budget.operations += Math.max(1, Math.ceil(units))
 
     if (this.budget.operations > this.limits.maxOperations) {
       throw new InterpreterRuntimeError(`Execution exceeded its operation limit of ${this.limits.maxOperations}.`, node, "OperationLimitExceeded")
@@ -2112,8 +2663,20 @@ class Interpreter<R> {
   }
 }
 
+/**
+ * Executes one Effect-native Rune Program without constructing a reusable runtime.
+ *
+ * @example
+ * ```ts
+ * const result = yield* Rune.execute({
+ *   tools: { lookup },
+ *   code: `return await tools.lookup({ id: "order_42" })`,
+ * })
+ * ```
+ */
 export const execute = <const Tools extends Record<string, unknown>, RA = never>(options: ExecuteOptions<Tools, RA>): Effect.Effect<ExecuteResult, never, Services<Tools> | RA> => {
   const limits = resolveExecutionLimits(options.limits)
+  ToolRuntime.assertValidTools((options.tools ?? {}) as HostTools<Services<Tools>>)
   const tools = ToolRuntime.make((options.tools ?? {}) as HostTools<Services<Tools>>, limits.maxToolCalls, limits, {
     ...(options.policy ? { policy: options.policy as Policy.RuntimeConfig } : {}),
     ...(options.requestApproval ? { requestApproval: options.requestApproval as RequestApproval<string, RA> } : {}),
@@ -2171,13 +2734,26 @@ export const execute = <const Tools extends Record<string, unknown>, RA = never>
   )
 }
 
+/**
+ * Creates an Effect-native runtime over explicit, schema-described capabilities.
+ *
+ * Use `run` for host-driven execution or `asTool` to expose one confined code tool to an
+ * agent framework. Capability requirements remain in the returned Effect environment.
+ *
+ * @example
+ * ```ts
+ * const rune = Rune.make({ tools: { orders: { lookup } } })
+ * const code = rune.asTool()
+ * ```
+ */
 export const make = <const Tools extends Record<string, unknown> = {}, RA = never>(options: RuneOptions<Tools, RA> = {} as RuneOptions<Tools, RA>): Rune<Services<Tools> | RA> => {
+  ToolRuntime.assertValidTools((options.tools ?? {}) as HostTools<Services<Tools>>)
   const run = (code: string) => execute({ ...options, code })
 
   return {
     catalog: () => ToolRuntime.catalog((options.tools ?? {}) as HostTools<Services<Tools>>, options.policy as Policy.RuntimeConfig | undefined),
     instructions: () => ToolRuntime.instructions((options.tools ?? {}) as HostTools<Services<Tools>>, options.policy as Policy.RuntimeConfig | undefined),
-    tool: () => ({
+    asTool: () => ({
       name: "code",
       description: ToolRuntime.instructions((options.tools ?? {}) as HostTools<Services<Tools>>, options.policy as Policy.RuntimeConfig | undefined),
       input: CodeInput,
@@ -2187,4 +2763,4 @@ export const make = <const Tools extends Record<string, unknown> = {}, RA = neve
   }
 }
 
-export * as Rune from "./rune.ts"
+export const Rune = { make, execute }

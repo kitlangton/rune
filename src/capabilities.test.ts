@@ -11,7 +11,7 @@ import { Http } from "./http.ts"
 import { Store } from "./store.ts"
 import { expectOk, isWellFormedResult } from "./test-harness.ts"
 import { Tool } from "./tool.ts"
-import { RunePromise } from "./promise.ts"
+import { Rune as PromiseRune, Tool as PromiseTool } from "./promise.ts"
 
 describe("policy", () => {
   const publish = Tool.make({
@@ -41,12 +41,22 @@ describe("policy", () => {
     expect(attempted).toBe(0)
   })
 
-  test("host policy can allow or deny typed capability paths", async () => {
+  test("uses allow as an allowlist and requires explicit auto-approval for sensitive tools", async () => {
     const allowed = Rune.make({
       tools: { publish },
-      policy: { allow: ["publish"] },
+      policy: { allow: ["publish"], autoApprove: ["publish"] },
     })
     expect(expectOk(await Effect.runPromise(allowed.run(`return await tools.publish("ok")`))).value).toBe("ok")
+
+    const omitted = Rune.make({
+      tools: { publish },
+      policy: { allow: [] },
+    })
+    const omittedResult = await Effect.runPromise(omitted.run(`return await tools.publish("no")`))
+    expect(omittedResult.ok).toBe(false)
+    if (omittedResult.ok) throw new Error("Expected allowlist denial")
+    expect(omittedResult.error.kind).toBe("UnknownCapability")
+    expect(omittedResult.toolCalls).toEqual([])
 
     const denied = Rune.make({
       tools: { publish },
@@ -55,17 +65,27 @@ describe("policy", () => {
     const result = await Effect.runPromise(denied.run(`return await tools.publish("no")`))
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error("Expected denial")
-    expect(result.error.kind).toBe("CapabilityDenied")
+    expect(result.error.kind).toBe("UnknownCapability")
     expect(isWellFormedResult(result)).toBe(true)
-    expect(result.error.message).toContain("Disabled in this workflow")
+    expect(result.toolCalls).toEqual([])
   })
 
   test("denied capabilities are omitted from discovery", async () => {
     const rune = Rune.make({ tools: { publish }, policy: { deny: ["publish"] } })
     expect(rune.instructions()).not.toContain("tools.publish")
     expect(rune.catalog()).toEqual([])
-    const searched = await Effect.runPromise(rune.run(`return await tools.search({ query: "publish" })`))
+    const searched = await Effect.runPromise(rune.run(`return await tools.$rune.search({ query: "publish" })`))
     expect(expectOk(searched).value).toEqual({ items: [], total: 0 })
+  })
+
+  test("discovery is reserved and governed by policy", async () => {
+    expect(() => Rune.make({ tools: { $rune: { publish } } })).toThrow("reserved")
+    const rune = Rune.make({ tools: { publish }, policy: { allow: ["publish"] } })
+    const hidden = await Effect.runPromise(rune.run(`return await tools.$rune.search({ query: "publish" })`))
+    expect(hidden.ok).toBe(false)
+    if (hidden.ok) throw new Error("Expected discovery to be excluded from the allowlist")
+    expect(hidden.error.kind).toBe("UnknownCapability")
+    expect(hidden.toolCalls).toEqual([])
   })
 
   test("passes policy reasons to Effect-based approval handlers", async () => {
@@ -81,7 +101,7 @@ describe("policy", () => {
 
     expect(expectOk(await Effect.runPromise(rune.run(`return await tools.publish("hello")`))).value).toBe("hello")
     expect(requested).toEqual({ path: "publish", input: "hello", reason: "Review external message" })
-    const described = expectOk(await Effect.runPromise(rune.run(`return await tools.describe({ path: "publish" })`)))
+    const described = expectOk(await Effect.runPromise(rune.run(`return await tools.$rune.describe({ path: "publish" })`)))
     expect((described.value as { signature: string }).signature).toContain("Requires approval")
   })
 
@@ -96,30 +116,44 @@ describe("policy", () => {
     if (result.ok) throw new Error("Expected invalid input")
     expect(result.error.kind).toBe("InvalidToolInput")
     expect(requests).toBe(0)
+    expect(result.toolCalls).toEqual([])
+  })
+
+  test("decodes encoded outputs before exposing them to a Rune Program", async () => {
+    const count = Tool.make({
+      description: "Read a count",
+      input: Schema.Struct({}),
+      output: Schema.NumberFromString,
+      run: () => Effect.succeed("42"),
+    })
+    const result = await Effect.runPromise(Rune.make({ tools: { count } }).run(`return await tools.count({}) + 1`))
+    expect(expectOk(result).value).toBe(43)
+    expect(Rune.make({ tools: { count } }).catalog()[0]?.signature).toContain("Promise<number>")
   })
 })
 
 describe("Promise adapter policy", () => {
   test("supports Promise approvals and policy-hidden capabilities", async () => {
     let executed = 0
-    const denied = RunePromise.make({
-      tools: { publish: () => { executed += 1; return "sent" } },
+    const denied = PromiseRune.make({
+      tools: { publish: PromiseTool.make({ description: "Publish", input: Schema.Struct({}), output: Schema.String, run: () => { executed += 1; return "sent" } }) },
       policy: { requireApproval: ["publish"] },
       requestApproval: async () => false,
     })
-    const rejected = await denied.run(`return tools.publish()`)
+    const rejected = await denied.run(`return tools.publish({})`)
     expect(rejected.ok).toBe(false)
     if (rejected.ok) throw new Error("Expected approval rejection")
     expect(rejected.error.kind).toBe("ApprovalDenied")
     expect(executed).toBe(0)
+    expect(rejected.toolCalls).toEqual([])
 
-    const hidden = RunePromise.make({
-      tools: { publish: RunePromise.tool({ description: "Publish", input: Schema.Struct({}), output: Schema.String, run: () => "sent" }) },
+    const hidden = PromiseRune.make({
+      tools: { publish: PromiseTool.make({ description: "Publish", input: Schema.Struct({}), output: Schema.String, run: () => "sent" }) },
       policy: { deny: ["publish"] },
     })
     expect(hidden.catalog()).toEqual([])
     expect(hidden.instructions()).not.toContain("tools.publish")
-    expect(expectOk(await hidden.run(`return tools.search({ query: "publish" })`)).value).toEqual({ items: [], total: 0 })
+    expect(expectOk(await hidden.run(`return tools.$rune.search({ query: "publish" })`)).value).toEqual({ items: [], total: 0 })
   })
 })
 
@@ -127,7 +161,6 @@ describe("standard capabilities", () => {
   test("clock and session store execute as ordinary capabilities", async () => {
     const rune = Rune.make({
       tools: { clock: Clock.make({ maxSleepMs: 0 }), store: Store.memory() },
-      policy: { allow: ["store.put"] },
     })
     const result = await Effect.runPromise(rune.run(`
       const now = await tools.clock.now({})
@@ -142,13 +175,13 @@ describe("standard capabilities", () => {
   test("session store bounds retained values and releases budget on delete", async () => {
     const rune = Rune.make({
       tools: { store: Store.memory({ maxBytes: 40 }) },
-      policy: { allow: ["store.*"] },
     })
 
     expect(expectOk(await Effect.runPromise(rune.run(`return await tools.store.put({ key: "a", value: "1234567890" })`))).value).toEqual({ stored: true })
     const full = await Effect.runPromise(rune.run(`return await tools.store.put({ key: "b", value: "1234567890" })`))
     expect(full.ok).toBe(false)
     if (full.ok) throw new Error("Expected retained-size rejection")
+    expect(full.error.kind).toBe("CapabilityFailure")
     expect(full.error.message).toContain("maximum retained size")
 
     expect(expectOk(await Effect.runPromise(rune.run(`return await tools.store.delete({ key: "a" })`))).value).toEqual({ deleted: true })
@@ -160,6 +193,26 @@ describe("standard capabilities", () => {
   test("session store rejects invalid configured bounds", () => {
     expect(() => Store.memory({ maxKeys: 0 })).toThrow()
     expect(() => Store.memory({ maxBytes: 0 })).toThrow()
+  })
+
+  test("standard packs reject invalid configured limits", () => {
+    expect(() => Clock.make({ maxSleepMs: -1 })).toThrow()
+    expect(() => Fs.readonly({ root: ".", maxReadBytes: Number.POSITIVE_INFINITY })).toThrow()
+    expect(() => Fs.workspace({ root: ".", maxWriteBytes: 0 })).toThrow()
+    expect(() => Http.targets({ api: { origin: "https://api.example.com" } }, { maxResponseBytes: 0 })).toThrow()
+    expect(() => Http.targets({ "github-api": { origin: "https://api.example.com" } })).toThrow()
+  })
+
+  test("session store is scratch state by default but can opt into approval", async () => {
+    const scratch = Rune.make({ tools: { store: Store.memory() } })
+    expect(expectOk(await Effect.runPromise(scratch.run(`return await tools.store.put({ key: "a", value: 1 })`))).value).toEqual({ stored: true })
+
+    const guarded = Rune.make({ tools: { store: Store.memory({ approval: "required" }) } })
+    const denied = await Effect.runPromise(guarded.run(`return await tools.store.put({ key: "a", value: 1 })`))
+    expect(denied.ok).toBe(false)
+    if (denied.ok) throw new Error("Expected approval denial")
+    expect(denied.error.kind).toBe("ApprovalDenied")
+    expect(denied.toolCalls).toEqual([])
   })
 
   test("mounted filesystem reads and approval-gated writes stay under root", async () => {
@@ -198,6 +251,8 @@ describe("standard capabilities", () => {
 
     const escaped = await Effect.runPromise(rune.run(`return await tools.fs.readText({ path: "../secret" })`).pipe(Effect.provide(layer)))
     expect(escaped.ok).toBe(false)
+    if (escaped.ok) throw new Error("Expected filesystem boundary rejection")
+    expect(escaped.error.kind).toBe("CapabilityFailure")
 
     const limited = Rune.make({ tools: { fs: Fs.readonly({ root, maxReadBytes: 4 }) } })
     const oversized = await Effect.runPromise(limited.run(`return await tools.fs.readText({ path: "docs/readme.md" })`).pipe(Effect.provide(layer)))
@@ -230,7 +285,7 @@ describe("standard capabilities", () => {
     await rm(outside, { recursive: true, force: true })
   })
 
-  test("named HTTP targets constrain destination and require approval", async () => {
+  test("named HTTP targets are policy-addressable capabilities and require approval", async () => {
     const previous = globalThis.fetch
     const mockFetch = (async (input) => String(input).endsWith("/redirect")
       ? new Response(null, { status: 302, headers: { location: "https://internal.example/admin" } })
@@ -241,55 +296,58 @@ describe("standard capabilities", () => {
     globalThis.fetch = mockFetch
     try {
       const rune = Rune.make({
-        tools: { http: Http.targets({ targets: { api: { origin: "https://api.example.com", methods: ["GET"], pathPrefixes: ["/v1/"] } } }) },
+        tools: { http: Http.targets({ api: { origin: "https://api.example.com", methods: ["GET"], pathPrefixes: ["/v1/"] } }) },
         requestApproval: () => true,
       })
-      const ok = await Effect.runPromise(rune.run(`return await tools.http.request({ target: "api", method: "GET", path: "/v1/issues" })`).pipe(Effect.provide(FetchHttpClient.layer)))
+      expect(rune.catalog()[0]?.path).toBe("http.api.get")
+      const ok = await Effect.runPromise(rune.run(`return await tools.http.api.get({ path: "/v1/issues" })`).pipe(Effect.provide(FetchHttpClient.layer)))
       expect(expectOk(ok).value).toEqual({ status: 200, body: { url: "https://api.example.com/v1/issues" } })
 
-      const blocked = await Effect.runPromise(rune.run(`return await tools.http.request({ target: "api", method: "GET", path: "/admin" })`).pipe(Effect.provide(FetchHttpClient.layer)))
-      expect(blocked.ok).toBe(false)
+      const prohibited = Rune.make({
+        tools: { http: Http.targets({ api: { origin: "https://api.example.com", methods: ["GET"] } }) },
+        policy: { deny: ["http.api.get"] },
+      })
+      const denied = await Effect.runPromise(prohibited.run(`return await tools.http.api.get({ path: "/" })`).pipe(Effect.provide(FetchHttpClient.layer)))
+      expect(denied.ok).toBe(false)
+      if (denied.ok) throw new Error("Expected HTTP policy denial")
+      expect(denied.error.kind).toBe("UnknownCapability")
+      expect(denied.toolCalls).toEqual([])
 
-      const normalizedEscape = await Effect.runPromise(rune.run(`return await tools.http.request({ target: "api", method: "GET", path: "/v1/../admin" })`).pipe(Effect.provide(FetchHttpClient.layer)))
+      const blocked = await Effect.runPromise(rune.run(`return await tools.http.api.get({ path: "/admin" })`).pipe(Effect.provide(FetchHttpClient.layer)))
+      expect(blocked.ok).toBe(false)
+      if (blocked.ok) throw new Error("Expected HTTP path rejection")
+      expect(blocked.error.kind).toBe("CapabilityFailure")
+
+      const normalizedEscape = await Effect.runPromise(rune.run(`return await tools.http.api.get({ path: "/v1/../admin" })`).pipe(Effect.provide(FetchHttpClient.layer)))
       expect(normalizedEscape.ok).toBe(false)
-      const encodedEscape = await Effect.runPromise(rune.run(`return await tools.http.request({ target: "api", method: "GET", path: "/v1/%2e%2e/admin" })`).pipe(Effect.provide(FetchHttpClient.layer)))
+      const encodedEscape = await Effect.runPromise(rune.run(`return await tools.http.api.get({ path: "/v1/%2e%2e/admin" })`).pipe(Effect.provide(FetchHttpClient.layer)))
       expect(encodedEscape.ok).toBe(false)
 
       const segmentTarget = Rune.make({
-        tools: { http: Http.targets({ targets: { api: { origin: "https://api.example.com", methods: ["GET"], pathPrefixes: ["/v1"] } } }) },
+        tools: { http: Http.targets({ api: { origin: "https://api.example.com", methods: ["GET"], pathPrefixes: ["/v1"] } }) },
         requestApproval: () => true,
       })
-      const siblingPrefix = await Effect.runPromise(segmentTarget.run(`return await tools.http.request({ target: "api", method: "GET", path: "/v10/admin" })`).pipe(Effect.provide(FetchHttpClient.layer)))
+      const siblingPrefix = await Effect.runPromise(segmentTarget.run(`return await tools.http.api.get({ path: "/v10/admin" })`).pipe(Effect.provide(FetchHttpClient.layer)))
       expect(siblingPrefix.ok).toBe(false)
 
       const limited = Rune.make({
-        tools: { http: Http.targets({ maxResponseBytes: 4, targets: { api: { origin: "https://api.example.com", methods: ["GET"], pathPrefixes: ["/v1/"] } } }) },
+        tools: { http: Http.targets({ api: { origin: "https://api.example.com", methods: ["GET"], pathPrefixes: ["/v1/"] } }, { maxResponseBytes: 4 }) },
         requestApproval: () => true,
       })
-      const oversized = await Effect.runPromise(limited.run(`return await tools.http.request({ target: "api", method: "GET", path: "/v1/large" })`).pipe(Effect.provide(FetchHttpClient.layer)))
+      const oversized = await Effect.runPromise(limited.run(`return await tools.http.api.get({ path: "/v1/large" })`).pipe(Effect.provide(FetchHttpClient.layer)))
       expect(oversized.ok).toBe(false)
       if (oversized.ok) throw new Error("Expected HTTP size rejection")
       expect(oversized.error.message).toContain("exceeds 4 bytes")
 
-      const redirected = await Effect.runPromise(rune.run(`return await tools.http.request({ target: "api", method: "GET", path: "/v1/redirect" })`).pipe(Effect.provide(FetchHttpClient.layer)))
+      const redirected = await Effect.runPromise(rune.run(`return await tools.http.api.get({ path: "/v1/redirect" })`).pipe(Effect.provide(FetchHttpClient.layer)))
       expect(redirected.ok).toBe(false)
       if (redirected.ok) throw new Error("Expected redirect rejection")
       expect(redirected.error.message).toContain("redirects are not allowed")
 
-      const privateTarget = Rune.make({
-        tools: { http: Http.targets({ targets: { internal: { origin: "https://localhost", methods: ["GET"] } } }) },
-        requestApproval: () => true,
-      })
-      const privateResult = await Effect.runPromise(privateTarget.run(`return await tools.http.request({ target: "internal", method: "GET", path: "/" })`).pipe(Effect.provide(FetchHttpClient.layer)))
-      expect(privateResult.ok).toBe(false)
+      expect(() => Http.targets({ internal: { origin: "https://localhost", methods: ["GET"] } })).toThrow()
 
       for (const origin of ["https://[::1]", "https://[fd00::1]", "https://[fe80::1]", "https://[::ffff:127.0.0.1]"]) {
-        const ipv6 = Rune.make({
-          tools: { http: Http.targets({ targets: { internal: { origin, methods: ["GET"] } } }) },
-          requestApproval: () => true,
-        })
-        const result = await Effect.runPromise(ipv6.run(`return await tools.http.request({ target: "internal", method: "GET", path: "/" })`).pipe(Effect.provide(FetchHttpClient.layer)))
-        expect(result.ok).toBe(false)
+        expect(() => Http.targets({ internal: { origin, methods: ["GET"] } })).toThrow()
       }
     } finally {
       globalThis.fetch = previous

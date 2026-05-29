@@ -1,17 +1,20 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Schema } from "effect"
-import { Rune, type ExecuteResult, type ToolCall } from "./rune.ts"
-import { RunePromise } from "./promise.ts"
+import { Rune, type ExecuteResult, type ExecutionLimits, type ToolCall } from "./rune.ts"
+import { Rune as PromiseRune, Tool as PromiseTool } from "./promise.ts"
 import { Tool } from "./tool.ts"
 
-const runExecute = (options: Parameters<typeof RunePromise.execute>[0]) => RunePromise.execute(options)
+type TestTools = { readonly [name: string]: ((...args: Array<unknown>) => unknown | PromiseLike<unknown>) | TestTools }
+
+const runExecute = (options: { readonly code: string; readonly tools?: TestTools; readonly limits?: ExecutionLimits }) =>
+  PromiseRune.execute(options as never)
 
 const expectOk = (
   result: ExecuteResult,
 ): {
   ok: true
   value: unknown
-  toolCalls: Array<ToolCall>
+  toolCalls: ReadonlyArray<ToolCall>
 } => {
   expect(result.ok).toBe(true)
 
@@ -22,7 +25,7 @@ const expectOk = (
   return result
 }
 
-describe("RunePromise.execute", () => {
+describe("Rune from promise entrypoint execute", () => {
   test("runs tool-calling + arithmetic script", async () => {
     const result = await runExecute({
       code: `
@@ -493,16 +496,16 @@ describe("RunePromise.execute", () => {
 
   test("returns clear error for unsupported syntax", async () => {
     const result = await runExecute({
-      code: `function unsupported() { return 1 }`,
+      code: `class Unsupported {}`,
     })
 
     expect(result.ok).toBe(false)
 
     if (result.ok) {
-      throw new Error("Expected failure for unsupported FunctionDeclaration")
+      throw new Error("Expected failure for unsupported ClassDeclaration")
     }
 
-    expect(result.error.message).toContain("Syntax 'FunctionDeclaration' is not supported in Rune")
+    expect(result.error.message).toContain("Syntax 'ClassDeclaration' is not supported in Rune")
     expect(result.error.message).toContain("Supported orchestration syntax")
     expect(result.error.kind).toBe("UnsupportedSyntax")
     expect(result.error.location).toEqual({ line: 1, column: 1 })
@@ -672,12 +675,17 @@ describe("RunePromise.execute", () => {
   })
 })
 
-describe("RunePromise.make", () => {
+describe("Rune from promise entrypoint make", () => {
   test("binds capabilities for repeated code-mode runs", async () => {
-    const rune = RunePromise.make({
+    const rune = PromiseRune.make({
       tools: {
         account: {
-          lookup: (id: unknown) => ({ id, active: true }),
+          lookup: PromiseTool.make({
+            description: "Look up an account",
+            input: Schema.String,
+            output: Schema.Struct({ id: Schema.String, active: Schema.Boolean }),
+            run: (id) => ({ id, active: true }),
+          }),
         },
       },
     })
@@ -693,14 +701,14 @@ describe("RunePromise.make", () => {
   })
 
   test("adapts described Promise tools into discovery and execution", async () => {
-    const issue = RunePromise.tool({
+    const issue = PromiseTool.make({
       description: "Get an issue",
       input: Schema.Struct({ id: Schema.String }),
       output: Schema.Struct({ id: Schema.String }),
       run: async ({ id }) => ({ id }),
     })
-    const result = await RunePromise.make({ tools: { issue } }).run(`
-      const { items } = tools.search({ query: "issue" })
+    const result = await PromiseRune.make({ tools: { issue } }).run(`
+      const { items } = tools.$rune.search({ query: "issue" })
       return tools.issue({ id: items[0].path })
     `)
 
@@ -713,7 +721,12 @@ describe("Rune.make", () => {
     const rune = Rune.make({
       tools: {
         values: {
-          double: (value: unknown) => Effect.succeed(Number(value) * 2),
+          double: Tool.make({
+            description: "Double a number",
+            input: Schema.Number,
+            output: Schema.Number,
+            run: (value) => Effect.succeed(value * 2),
+          }),
         },
       },
     })
@@ -728,9 +741,9 @@ describe("Rune.make", () => {
   test("interrupts an Effect tool when the Rune timeout expires", async () => {
     const result = await Effect.runPromise(
       Rune.make({
-        tools: { wait: () => Effect.sleep("1 second") },
+        tools: { wait: Tool.make({ description: "Wait", input: Schema.Struct({}), output: Schema.Unknown, run: () => Effect.sleep("1 second") }) },
         limits: { timeoutMs: 1 },
-      }).run(`return tools.wait()`),
+      }).run(`return tools.wait({})`),
     )
 
     expect(result.ok).toBe(false)
@@ -741,10 +754,10 @@ describe("Rune.make", () => {
   test("lets Rune Programs recover from typed Effect tool failures", async () => {
     const result = await Effect.runPromise(
       Rune.make({
-        tools: { lookup: () => Effect.fail("missing record") },
+        tools: { lookup: Tool.make({ description: "Look up", input: Schema.Struct({}), output: Schema.Unknown, run: () => Effect.fail("missing record") }) },
       }).run(`
         try {
-          return tools.lookup()
+          return tools.lookup({})
         } catch (error) {
           return error.message
         }
@@ -765,8 +778,8 @@ describe("Rune.make", () => {
 
     const result = await Effect.runPromise(
       Rune.make({ tools: { github: { issues: { get: getIssue } } } }).run(`
-        const { items } = tools.search({ query: "github issue" })
-        const details = tools.describe({ path: items[0].path })
+        const { items } = tools.$rune.search({ query: "github issue" })
+        const details = tools.$rune.describe({ path: items[0].path })
         const issue = tools.github.issues.get({ id: "42" })
         return { path: details.path, signature: details.signature, title: issue.title }
       `),
@@ -774,7 +787,7 @@ describe("Rune.make", () => {
 
     const okResult = expectOk(result)
     expect(okResult.value).toEqual({ path: "github.issues.get", signature: `tools.github.issues.get(input: { id: string }): Promise<{ id: string; title: string }>`, title: "Issue 42" })
-    expect(okResult.toolCalls.map((call) => call.name)).toEqual(["search", "describe", "github.issues.get"])
+    expect(okResult.toolCalls.map((call) => call.name)).toEqual(["$rune.search", "$rune.describe", "github.issues.get"])
   })
 
   test("generates prompt instructions from described tool schemas", () => {
@@ -788,7 +801,7 @@ describe("Rune.make", () => {
     const instructions = Rune.make({ tools: { github: { issues: { get: issue } } } }).instructions()
     expect(instructions).toContain("tools.github.issues.get(input: { id: string }): Promise<{ id: string; title: string }>")
     expect(instructions).toContain("Get a GitHub issue by id")
-    expect(instructions).toContain("tools.search")
+    expect(instructions).toContain("tools.$rune.search")
   })
 
   test("exposes a structured host-side catalog for custom prompts", () => {
@@ -813,7 +826,7 @@ describe("Rune.make", () => {
       output: Schema.Struct({ id: Schema.String }),
       run: ({ id }) => Effect.succeed({ id }),
     })
-    const codeTool = Rune.make({ tools: { issue } }).tool()
+    const codeTool = Rune.make({ tools: { issue } }).asTool()
 
     expect(codeTool.name).toBe("code")
     expect(Schema.decodeUnknownSync(codeTool.input)({ code: "return 1" })).toEqual({ code: "return 1" })

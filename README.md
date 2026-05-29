@@ -5,7 +5,7 @@
 Rune executes a small, confined TypeScript-shaped language over your tools. The model writes familiar code to call capabilities, filter data, recover from failures, and return only the result it needs.
 
 ```bash
-bun add github:kitlangton/rune
+bun add @kitlangton/rune effect
 ```
 
 ## Happy Path
@@ -14,8 +14,7 @@ Your application has real capabilities, such as listing GitHub issues and postin
 
 ```ts
 import { Effect, Schema } from "effect"
-import { Rune } from "rune"
-import { Tool } from "rune/tool"
+import { Rune, Tool } from "@kitlangton/rune"
 
 const Issue = Schema.Struct({
   number: Schema.Number,
@@ -55,7 +54,7 @@ bun add ai
 
 ```ts
 import { generateText, stepCountIs } from "ai"
-import { RuneAiSdk } from "rune/ai-sdk"
+import { RuneAiSdk } from "@kitlangton/rune/ai-sdk"
 
 const result = await generateText({
   model,
@@ -115,7 +114,7 @@ Rune executes it and returns:
 }
 ```
 
-The model did one code-tool call. Rune composed two underlying capabilities, retained an audit trail, and returned only the useful summary.
+The model did one code-tool call. Rune composed two underlying capabilities, retained an audit trail of executed capabilities, and returned only the useful summary. Requests rejected by policy, approval, or input validation do not appear as executed `toolCalls`.
 
 ## Effect AI
 
@@ -124,44 +123,58 @@ Rune is Effect-native. Use the Effect AI adapter as the model toolkit:
 ```ts
 import { Effect } from "effect"
 import { LanguageModel } from "effect/unstable/ai"
-import { RuneEffectAi } from "rune/effect-ai"
+import { RuneEffectAi } from "@kitlangton/rune/effect-ai"
 
 const code = RuneEffectAi.make(rune)
 
-const response = yield* LanguageModel.generateText({
-  prompt: "Find high-priority open GitHub issues and send a summary to #eng-alerts.",
-  toolkit: code.toolkit,
+const response = Effect.gen(function*() {
+  return yield* LanguageModel.generateText({
+    prompt: "Find high-priority open GitHub issues and send a summary to #eng-alerts.",
+    toolkit: code.toolkit,
+  })
 }).pipe(Effect.provide(code.layer))
 ```
 
 Capability implementations remain Effects, so they can use services, tracing, typed failures, and interruption from the caller's runtime.
 
+If the configured Rune requires application services, use `makeWith` to provide them at the adapter boundary:
+
+```ts
+const code = RuneEffectAi.makeWith(rune, (effect) => effect.pipe(Effect.provide(appLayer)))
+```
+
 ## Promise Adapter
 
-For ordinary functions and promises, use `RunePromise`. It adapts them onto the same runtime:
+For ordinary functions and promises, import `Rune` from the Promise entrypoint. It adapts them onto the same runtime:
 
 ```ts
 import { Schema } from "effect"
-import { RunePromise } from "rune/promise"
+import { Rune, Tool } from "@kitlangton/rune/promise"
 
-const lookup = RunePromise.tool({
+const lookup = Tool.make({
   description: "Look up an order",
   input: Schema.Struct({ id: Schema.String }),
   output: Schema.Struct({ id: Schema.String, status: Schema.String }),
   run: ({ id }) => db.orders.get(id),
 })
 
-const rune = RunePromise.make({ tools: { orders: { get: lookup } } })
+const rune = Rune.make({ tools: { orders: { get: lookup } } })
 
 const result = await rune.run(`return await tools.orders.get({ id: "order_42" })`)
 ```
 
-## Custom Adapters
-
-`rune.tool()` is the neutral adapter surface if your agent library is not covered yet:
+`RuneAiSdk.make(rune)` accepts a Promise Rune or a service-free Effect Rune. For an Effect Rune that requires services, provide its execution boundary explicitly:
 
 ```ts
-const code = rune.tool()
+const code = RuneAiSdk.makeEffect(rune, (effect) => Effect.runPromise(effect.pipe(Effect.provide(appLayer))))
+```
+
+## Custom Adapters
+
+`rune.asTool()` is the neutral adapter surface if your agent library is not covered yet:
+
+```ts
+const code = rune.asTool()
 
 code.name        // "code"
 code.description // Rune instructions plus schema-derived capability signatures
@@ -179,11 +192,11 @@ bun run examples/effect-ai.ts
 
 ## Large Tool Catalogs
 
-For a small catalog, `rune.tool()` includes the schema-derived catalog in its description automatically. For a large or dynamic catalog, the agent can discover capabilities from within a Rune Program:
+For a small catalog, `rune.asTool()` includes the schema-derived catalog in its description automatically. For a large or dynamic catalog, the agent can discover capabilities from within a Rune Program:
 
 ```ts
-const { items } = await tools.search({ query: "create calendar event", limit: 5 })
-const tool = await tools.describe({ path: items[0].path })
+const { items } = await tools.$rune.search({ query: "create calendar event", limit: 5 })
+const tool = await tools.$rune.describe({ path: items[0].path })
 return tool.signature
 ```
 
@@ -231,7 +244,7 @@ try {
 return Promise.all([tools.a.read({}), tools.b.read({})])
 ```
 
-Supported today: TypeScript annotations, plain data, destructuring, optional chaining, conditionals, `switch`, loops, arrow callbacks and closures, spread, `try` / `catch` / `finally` / `throw`, common non-mutating array and string transformations, confined `Object` / `Math` / `JSON` helpers, primitive coercions, and constrained `Promise.all(...)`.
+Supported today: TypeScript annotations, plain data, destructuring (with rest/defaults), optional chaining, conditionals, `switch`, loops, arrow functions and `function` declarations (hoisted) with closures, default/rest parameters, spread, `try` / `catch` / `finally` / `throw` (including `new Error(...)`), common non-mutating array and string transformations, confined `Object` / `Math` / `JSON` helpers, primitive coercions, and constrained `Promise.all(...)`.
 
 Unsupported syntax returns a diagnostic the agent can use to rewrite and retry:
 
@@ -249,22 +262,20 @@ Unsupported syntax returns a diagnostic the agent can use to rewrite and retry:
 Rune Programs do not get ambient filesystem, network, environment, or timer access. Add explicit capabilities when needed, and gate sensitive calls per capability:
 
 ```ts
-import { Clock } from "rune/clock"
-import { Fs } from "rune/fs"
-import { Http } from "rune/http"
-import { Store } from "rune/store"
+import { Clock } from "@kitlangton/rune/clock"
+import { Fs } from "@kitlangton/rune/fs"
+import { Http } from "@kitlangton/rune/http"
+import { Store } from "@kitlangton/rune/store"
 
 const rune = Rune.make({
   tools: {
     github,
     fs: Fs.workspace({ root: "./workspace" }),
     http: Http.targets({
-      targets: {
-        github: {
-          origin: "https://api.github.com",
-          methods: ["GET"],
-          pathPrefixes: ["/repos/kitlangton/"],
-        },
+      github: {
+        origin: "https://api.github.com",
+        methods: ["GET"],
+        pathPrefixes: ["/repos/kitlangton/"],
       },
     }),
     store: Store.memory({ maxBytes: 1_000_000 }),
@@ -272,10 +283,10 @@ const rune = Rune.make({
   },
 
   policy: {
+    allow: ["github.*", "fs.*", "http.github.get", "store.*", "clock.*", "$rune.*"],
     requireApproval: [
       { path: "fs.writeText", reason: "This changes a workspace file" },
-      "http.request",
-      "store.put",
+      "http.github.get",
     ],
   },
 
@@ -287,8 +298,10 @@ const rune = Rune.make({
 `requestApproval` may return a `boolean` or `Effect<boolean>`:
 
 ```ts
-requestApproval: ({ path }) => path !== "http.request"
+requestApproval: ({ path }) => path !== "http.github.get"
 ```
+
+When `allow` is present it is an allowlist: unmatched capabilities are denied. It never bypasses an approval requirement; use `autoApprove` only when a sensitive capability should be explicitly allowed without prompting.
 
 The configured packs become ordinary agent-visible tools:
 
@@ -296,14 +309,15 @@ The configured packs become ordinary agent-visible tools:
 const readme = await tools.fs.readText({ path: "README.md" })
 const cached = await tools.store.get({ key: "summary" })
 const now = await tools.clock.now({})
+const issues = await tools.http.github.get({ path: "/repos/kitlangton/rune/issues" })
 ```
 
 Defaults:
 
 - `Fs.readonly(...)` provides read-only mounted file access with bounded streamed file reads.
-- `Fs.workspace(...)` adds write/remove operations that require approval unless policy allows them.
-- `Store.memory({ maxBytes })` bounds retained session data; mutations require approval unless policy allows them.
-- `Http.targets(...)` exposes named HTTPS targets with bounded streamed responses and requires approval unless policy allows requests. Configure injected HTTP transports not to follow redirects invisibly, and validate DNS/network egress at the host boundary when private-network exclusion is required.
+- `Fs.workspace(...)` adds write/remove operations that require approval unless policy explicitly uses `autoApprove`. Generic filesystem path APIs cannot eliminate check/use races if another untrusted process can concurrently replace paths inside the mounted root; use only roots with trusted mutation ownership unless your host filesystem implementation enforces no-follow operations atomically.
+- `Store.memory({ maxBytes })` is bounded memory scoped to the pack instance, and therefore persists across repeated runs of a shared `Rune`. Construct it per user/session where isolation matters. Set `approval: "required"` if mutations must be approved.
+- `Http.targets(...)` exposes each allowed method as its own policy path, such as `tools.http.github.get(...)` or `tools.http.github.post(...)`; requests require approval unless policy explicitly uses `autoApprove`. Only auto-approve specifically safe method leaves. Configure injected HTTP transports not to follow redirects invisibly, and validate DNS/network egress at the host boundary when private-network exclusion is required.
 - `Clock.make(...)` provides bounded `now` / `sleep` operations without approval.
 - No raw environment or secret accessor is provided; keep credentials inside host-backed tools.
 
@@ -318,6 +332,17 @@ return Promise.constructor                                // rejected
 ```
 
 There are no imports, ambient globals, native prototypes, filesystem calls, network calls, or arbitrary host functions exposed to the program. Limits cover operations, capability calls, retained audit bytes, concurrency, source/data size, nesting depth, collection length, and wall time. Effect timeouts interrupt running capabilities.
+
+Configure tighter limits for the authority and latency budget of each code tool:
+
+```ts
+const rune = Rune.make({
+  tools,
+  limits: { maxToolCalls: 20, maxConcurrency: 4, timeoutMs: 5_000 },
+})
+```
+
+Defaults are `maxToolCalls: 100`, `maxConcurrency: 8`, `timeoutMs: 10_000`, `maxSourceBytes: 32_000`, `maxDataBytes: 256_000`, `maxAuditBytes: 1_000_000`, `maxValueDepth: 32`, `maxCollectionLength: 10_000`, and `maxOperations: 100_000`.
 
 Rune is an in-process confined interpreter. A separate process remains useful defense in depth for hostile multi-tenant workloads.
 

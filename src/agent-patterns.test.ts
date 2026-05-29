@@ -16,7 +16,7 @@ describe("array methods agents reach for", () => {
 describe("agent retry diagnostics for still-unsupported methods", () => {
   test.each([
     ["splice", `return [1, 2, 3].splice(0, 1)`],
-    ["reduceRight", `return [1, 2].reduceRight((a, b) => a + b)`],
+    ["fill", `return [1, 2, 3].fill(0)`],
   ])("Array.%s returns a retryable rewrite hint", async (_method, code) => {
     const failure = await expectFailure(code, { kind: "UnsupportedSyntax" })
     expect(failure.error.message).toContain("Rewrite using")

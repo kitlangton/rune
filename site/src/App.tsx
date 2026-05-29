@@ -3,7 +3,7 @@ import { AnimatePresence, LazyMotion, MotionConfig, domAnimation, m, useReducedM
 import { Effect, Schema } from "effect"
 import { Rune, type ExecuteResult } from "../../src/rune.ts"
 import { Tool } from "../../src/tool.ts"
-import { catalog, type HostTools } from "../../src/tool-runtime.ts"
+import { catalog } from "../../src/tool-runtime.ts"
 
 type AuditState = "running" | "succeeded" | "failed"
 type RunState = "idle" | "running" | "success" | "failure"
@@ -69,8 +69,8 @@ return { status: "No action required" }`,
   },
   {
     title: "Discover",
-    code: `const found = await tools.search({ query: "telemetry", limit: 2 })
-const capability = await tools.describe({ path: found.items[0].path })
+    code: `const found = await tools.$rune.search({ query: "telemetry", limit: 2 })
+const capability = await tools.$rune.describe({ path: found.items[0].path })
 
 return {
   matches: found.total,
@@ -179,8 +179,8 @@ const syntax = (line: string): ReactNode => line.split(syntaxPattern).map((part,
 
 function CodeView({ lines, activeLine, completedLine }: {
   readonly lines: ReadonlyArray<string>
-  readonly activeLine?: number
-  readonly completedLine?: number
+  readonly activeLine?: number | undefined
+  readonly completedLine?: number | undefined
 }) {
   return (
     <code>
@@ -197,12 +197,7 @@ function CodeView({ lines, activeLine, completedLine }: {
   )
 }
 
-type DemoRuntime = {
-  readonly tools: HostTools
-  readonly appendIntrinsicCalls: (result: ExecuteResult) => void
-}
-
-const makeRuntime = (publish: (entries: ReadonlyArray<AuditEntry>) => void): DemoRuntime => {
+const makeRuntime = (publish: (entries: ReadonlyArray<AuditEntry>) => void) => {
   let entries: Array<AuditEntry> = []
   let nextId = 0
 
@@ -225,7 +220,7 @@ const makeRuntime = (publish: (entries: ReadonlyArray<AuditEntry>) => void): Dem
       return value
     })
 
-  const tools: HostTools = {
+  const tools = {
     operations: {
       incidents: Tool.make({
         description: "List live incidents in a region",

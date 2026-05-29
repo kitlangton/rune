@@ -6,10 +6,6 @@
       "name": "rune",
       "dependencies": {
         "acorn": "^8.15.0",
-        "effect": "^4.0.0-beta.74",
-        "motion": "^12.40.0",
-        "react": "^19.2.6",
-        "react-dom": "^19.2.6",
         "typescript": "^5.9.3",
       },
       "devDependencies": {
@@ -18,11 +14,16 @@
         "@types/react": "^19.2.15",
         "@types/react-dom": "^19.2.3",
         "@vitejs/plugin-react": "^6.0.2",
+        "effect": "^4.0.0-beta.74",
         "fast-check": "^4.8.0",
+        "motion": "^12.40.0",
+        "react": "^19.2.6",
+        "react-dom": "^19.2.6",
         "vite": "^8.0.14",
       },
       "peerDependencies": {
         "ai": "^6.0.0",
+        "effect": "^4.0.0-beta.74",
       },
       "optionalPeers": [
         "ai",

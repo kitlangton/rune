@@ -80,7 +80,7 @@ describe("unsupported syntax fails gracefully (retryable diagnostics)", () => {
   // The core UX claim: anything outside the subset → ok:false with a known kind and a
   // message, so the agent can rewrite and retry rather than the host throwing.
   const cases: ReadonlyArray<readonly [string, string, DiagnosticKind]> = [
-    ["function declaration", `function f() { return 1 }\nreturn f()`, "UnsupportedSyntax"],
+    ["generator function", `function* g() { yield 1 }\nreturn 1`, "UnsupportedSyntax"],
     ["class declaration", `class A {}\nreturn 1`, "UnsupportedSyntax"],
     ["for-in loop", `for (const k in { a: 1 }) {}\nreturn 1`, "UnsupportedSyntax"],
     ["new expression", `return new Date()`, "UnsupportedSyntax"],

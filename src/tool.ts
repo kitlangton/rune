@@ -14,7 +14,7 @@ export type Options<I extends Schema.Decoder<unknown>, O extends Schema.Decoder<
   readonly input: I
   readonly output: O
   readonly approval?: "required"
-  readonly run: (input: I["Type"]) => Effect.Effect<O["Type"], unknown, R>
+  readonly run: (input: I["Type"]) => Effect.Effect<O["Encoded"], unknown, R>
 }
 
 export const isDefinition = <R = never>(value: unknown): value is Definition<R> =>
@@ -65,14 +65,32 @@ const renderSchema = (schema: JsonSchema, definitions: Readonly<Record<string, J
   return "unknown"
 }
 
-export const toTypeScript = (schema: Schema.Top): string => {
-  const document = Schema.toJsonSchemaDocument(schema) as {
+export const toTypeScript = (schema: Schema.Top, decoded = false): string => {
+  const visible = decoded ? Schema.toType(schema) : schema
+  const document = Schema.toJsonSchemaDocument(visible) as {
     readonly schema: JsonSchema
     readonly definitions?: Readonly<Record<string, JsonSchema>>
   }
   return renderSchema(document.schema, document.definitions ?? {})
 }
 
+/**
+ * Defines one schema-described capability available to a Rune Program through `tools.*`.
+ *
+ * `input` is decoded before `run` is invoked. `run` returns the encoded representation of
+ * `output`, which Rune decodes before returning it to the program. Mark externally sensitive
+ * operations with `approval: "required"`.
+ *
+ * @example
+ * ```ts
+ * const lookup = Tool.make({
+ *   description: "Look up an order",
+ *   input: Schema.Struct({ id: Schema.String }),
+ *   output: Schema.Struct({ status: Schema.String }),
+ *   run: ({ id }) => Effect.succeed({ status: "open" }),
+ * })
+ * ```
+ */
 export const make = <I extends Schema.Decoder<unknown>, O extends Schema.Decoder<unknown>, R>(options: Options<I, O, R>): Definition<R> => ({
   _tag: "RuneTool",
   description: options.description,
@@ -82,4 +100,4 @@ export const make = <I extends Schema.Decoder<unknown>, O extends Schema.Decoder
   run: (input) => options.run(input as I["Type"]),
 })
 
-export * as Tool from "./tool.ts"
+export * as Tool from "./tool.js"

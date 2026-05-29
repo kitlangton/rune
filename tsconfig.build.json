@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "rewriteRelativeImportExtensions": true
+  },
+  "files": [
+    "src/rune.ts",
+    "src/promise.ts",
+    "src/ai-sdk.ts",
+    "src/effect-ai.ts",
+    "src/policy.ts",
+    "src/clock.ts",
+    "src/store.ts",
+    "src/fs.ts",
+    "src/http.ts"
+  ],
+  "exclude": ["src/*.test.ts", "src/main.ts", "site", "dist", "vite.config.ts"]
+}

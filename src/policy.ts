@@ -20,23 +20,32 @@ type NamespacePath<T, Prefix extends string = ""> = T extends Leaf
     : never
 
 export type CapabilityPath<Tools> = LeafPath<Tools>
-export type Pattern<Tools> = CapabilityPath<Tools> | `${NamespacePath<Tools>}.*` | "*"
+export type BuiltinPath = "$rune.search" | "$rune.describe"
+export type Pattern<Tools = never> = [Tools] extends [never]
+  ? string
+  : CapabilityPath<Tools> | `${NamespacePath<Tools>}.*` | BuiltinPath | "$rune.*" | "*"
 
 export type Entry<P extends string = string> = P | {
   readonly path: P
   readonly reason?: string
 }
 
-export type Config<Tools = Record<string, unknown>> = {
+export type Config<Tools = never> = {
+  /** Optional allowlist. Unmatched capabilities are hidden and unavailable. */
   readonly allow?: ReadonlyArray<Entry<Pattern<Tools>>>
+  /** Explicitly hidden and unavailable capabilities. */
   readonly deny?: ReadonlyArray<Entry<Pattern<Tools>>>
+  /** Capabilities requiring host confirmation before execution. */
   readonly requireApproval?: ReadonlyArray<Entry<Pattern<Tools>>>
+  /** Explicit approval bypass for a normally guarded capability. */
+  readonly autoApprove?: ReadonlyArray<Entry<Pattern<Tools>>>
 }
 
 export type RuntimeConfig = {
   readonly allow?: ReadonlyArray<Entry>
   readonly deny?: ReadonlyArray<Entry>
   readonly requireApproval?: ReadonlyArray<Entry>
+  readonly autoApprove?: ReadonlyArray<Entry>
 }
 
 export type Request<P extends string = string> = {
@@ -67,13 +76,17 @@ export const decide = (config: RuntimeConfig | undefined, path: string, approval
   const denied = match(config?.deny, path)
   if (denied) return { action: "deny", ...(denied.reason ? { reason: denied.reason } : {}) }
 
-  const allowed = match(config?.allow, path)
-  if (allowed) return { action: "allow" }
+  if (config?.allow && !match(config.allow, path)) {
+    return { action: "deny", reason: `Capability '${path}' is not included in the policy allowlist.` }
+  }
 
   const approval = match(config?.requireApproval, path)
   if (approval) return { action: "requireApproval", ...(approval.reason ? { reason: approval.reason } : {}) }
 
+  const approved = match(config?.autoApprove, path)
+  if (approved) return { action: "allow" }
+
   return approvalRequired ? { action: "requireApproval" } : { action: "allow" }
 }
 
-export * as Policy from "./policy.ts"
+export * as Policy from "./policy.js"

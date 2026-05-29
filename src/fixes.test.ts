@@ -134,7 +134,7 @@ describe("H4 · maxDataBytes bounds every output that crosses the boundary", () 
     if (!result.ok) expect(result.error.kind).toBe("InvalidDataValue")
   })
 
-  test("tools.search results are bounded", async () => {
+  test("tools.$rune.search results are bounded", async () => {
     const tools: HostTools = {}
     for (let i = 0; i < 200; i += 1) {
       tools[`capability_${i}`] = Tool.make({
@@ -144,7 +144,7 @@ describe("H4 · maxDataBytes bounds every output that crosses the boundary", () 
         run: () => Effect.succeed({}),
       })
     }
-    const result = await runEffect(`return tools.search({ limit: 200 })`, { tools, limits: { maxDataBytes: 256 } })
+    const result = await runEffect(`return tools.$rune.search({ limit: 200 })`, { tools, limits: { maxDataBytes: 256 } })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.error.kind).toBe("InvalidDataValue")
   })

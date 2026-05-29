@@ -1,6 +1,6 @@
 import { Effect, Schema } from "effect"
-import { Policy, type RequestApproval } from "./policy.ts"
-import { isDefinition as isToolDefinition, toTypeScript, type Definition } from "./tool.ts"
+import { Policy, type RequestApproval } from "./policy.js"
+import { isDefinition as isToolDefinition, toTypeScript, type Definition } from "./tool.js"
 
 export type HostTool<R = never> = (...args: Array<unknown>) => Effect.Effect<unknown, unknown, R>
 
@@ -18,7 +18,7 @@ export type Services<Tools> = Tools extends (...args: Array<unknown>) => Effect.
 
 export type ToolCall = {
   name: string
-  args: Array<unknown>
+  args: ReadonlyArray<unknown>
 }
 
 export type ToolDescription = {
@@ -28,6 +28,8 @@ export type ToolDescription = {
 }
 
 export type SafeObject = Record<string, unknown>
+
+const reservedNamespace = "$rune"
 
 export class ToolReference {
   constructor(readonly path: ReadonlyArray<string>) {}
@@ -141,7 +143,7 @@ const describeDefinition = <R>(path: string, definition: Definition<R>, policy?:
   return {
     path,
     description: definition.description,
-    signature: `tools.${path}(input: ${toTypeScript(definition.input)}): Promise<${toTypeScript(definition.output)}>${suffix}`,
+    signature: `tools.${path}(input: ${toTypeScript(definition.input)}): Promise<${toTypeScript(definition.output, true)}>${suffix}`,
   }
 }
 
@@ -154,8 +156,20 @@ const visibleDefinitions = <R>(tools: HostTools<R>, policy?: Policy.RuntimeConfi
 export const catalog = <R>(tools: HostTools<R>, policy?: Policy.RuntimeConfig): ReadonlyArray<ToolDescription> =>
   visibleDefinitions(tools, policy).map(({ description }) => description)
 
+export const assertValidTools = <R>(tools: HostTools<R>): void => {
+  if (Object.hasOwn(tools, reservedNamespace)) {
+    throw new Error(`Tool namespace '${reservedNamespace}' is reserved for Rune discovery capabilities.`)
+  }
+}
+
 export const instructions = <R>(tools: HostTools<R>, policy?: Policy.RuntimeConfig): string => {
   const described = catalog(tools, policy)
+  const canSearch = Policy.decide(policy, "$rune.search").action !== "deny"
+  const canDescribe = Policy.decide(policy, "$rune.describe").action !== "deny"
+  const discovery = [
+    ...(canSearch ? ["- tools.$rune.search({ query: string, limit?: number }): Promise<{ items: Array<{ path: string; description: string }>; total: number }>"] : []),
+    ...(canDescribe ? ["- tools.$rune.describe({ path: string }): Promise<{ path: string; description: string; signature: string }>"] : []),
+  ]
   const lines = [
     "Write a Rune Program to answer the request. Return code only.",
     "Rune Programs can call explicit tools.* capabilities and transform plain data.",
@@ -164,12 +178,13 @@ export const instructions = <R>(tools: HostTools<R>, policy?: Policy.RuntimeConf
     "Available Tool Capabilities:",
     ...described.map((tool) => `- ${tool.signature} // ${tool.description}`),
     "",
-    "For a large or dynamic catalog, you can discover additional capabilities in the program:",
-    "- tools.search({ query: string, limit?: number }): Promise<{ items: Array<{ path: string; description: string }>; total: number }>",
-    "- tools.describe({ path: string }): Promise<{ path: string; description: string; signature: string }>",
-    "",
-    "Common syntax: destructuring, optional chaining, template literals, conditionals, switch, loops, spread, try/catch, ternary, and arrow callbacks/closures.",
-    "Transform data with array methods (map/filter/reduce/flatMap/forEach/find/findIndex/some/every/sort/slice/concat/indexOf/at/flat/reverse/includes/join), string methods (toLowerCase/toUpperCase/trim/split/slice/replace/replaceAll/includes/startsWith/endsWith/padStart/padEnd/repeat), Object.keys/values/entries/fromEntries, Math.* (incl. PI/E), JSON.parse/stringify, Array.from/isArray/of, parseInt/parseFloat, and Number/String/Boolean.",
+    ...(discovery.length > 0 ? [
+      "For a large or dynamic catalog, you can discover additional capabilities in the program:",
+      ...discovery,
+      "",
+    ] : []),
+    "Common syntax: arrow functions and `function` declarations (hoisted) with closures, default/rest parameters, destructuring (incl. rest/defaults), optional chaining, template literals, conditionals, switch, loops, spread (arrays/objects/strings), try/catch, ternary, the `in` operator, logical assignment (??=/||=/&&=), and bitwise operators (& | ^ ~ << >> >>>). Signal failure with `throw` (any value) or `throw new Error(message)`.",
+    "Transform data with array methods (map/filter/reduce/reduceRight/flatMap/forEach/find/findIndex/findLast/findLastIndex/sort/toSorted/slice/concat/indexOf/at/flat/reverse/toReversed/with/includes/join, plus push/pop/shift/unshift for accumulation), string methods (toLowerCase/toUpperCase/trim/split/slice/substring/replace/replaceAll/includes/startsWith/endsWith/indexOf/padStart/padEnd/repeat/charCodeAt), number methods (toFixed/toString(radix)/toPrecision), Object.keys/values/entries/fromEntries/hasOwn, Math.* (incl. PI/E), JSON.parse/stringify, Array.from/isArray/of, Number.isInteger/isNaN/parseInt, String.fromCharCode, parseInt/parseFloat, and Number/String/Boolean.",
     "Use Promise.all([...]) for parallel tool calls (a direct array of calls, or items.map((item) => tool call)).",
   ]
   return lines.join("\n")
@@ -180,7 +195,7 @@ const resolve = <R>(tools: HostTools<R>, path: ReadonlyArray<string>): HostTool<
 
   for (const segment of path) {
     if (isBlockedMember(segment) || typeof value === "function" || isDefinition(value) || !Object.hasOwn(value, segment)) {
-      throw new ToolRuntimeError("UnknownCapability", `Unknown tool '${path.join(".")}'.`, ["Use tools.search({ query }) to find available described capabilities."])
+      throw new ToolRuntimeError("UnknownCapability", `Unknown tool '${path.join(".")}'.`, ["Use tools.$rune.search({ query }) to find available described capabilities."])
     }
     value = value[segment] as HostTool<R> | Definition<R> | HostTools<R>
   }
@@ -222,15 +237,23 @@ export const make = <R, RA = never>(
     return copied
   }
 
+  const recordCall = (call: ToolCall): void => {
+    if (calls.length >= maxToolCalls) {
+      throw new ToolRuntimeError("ToolCallLimitExceeded", `Execution exceeded its tool-call limit of ${maxToolCalls}.`)
+    }
+    const auditEntryBytes = dataByteLength(call)
+    if (auditBytes + auditEntryBytes > dataLimits.maxAuditBytes) {
+      throw new ToolRuntimeError("AuditLimitExceeded", `Execution exceeds its audit-trail limit of ${dataLimits.maxAuditBytes} bytes.`)
+    }
+    auditBytes += auditEntryBytes
+    calls.push(call)
+  }
+
   return {
     root: new ToolReference([]),
     calls,
     invoke: (path, args) =>
       Effect.gen(function*() {
-        if (calls.length >= maxToolCalls) {
-          throw new ToolRuntimeError("ToolCallLimitExceeded", `Execution exceeded its tool-call limit of ${maxToolCalls}.`)
-        }
-
         const name = path.join(".")
         const externalArgs = args.map((arg) => copyOut(copyIn(arg, `Arguments for tool '${name}'`, dataLimits)))
         const argumentBytes = dataByteLength(externalArgs)
@@ -238,42 +261,60 @@ export const make = <R, RA = never>(
           throw new ToolRuntimeError("InvalidDataValue", `Arguments for tool '${name}' exceed ${dataLimits.maxDataBytes} bytes.`)
         }
         const call = { name, args: externalArgs }
-        const auditEntryBytes = dataByteLength(call)
-        if (auditBytes + auditEntryBytes > dataLimits.maxAuditBytes) {
-          throw new ToolRuntimeError("AuditLimitExceeded", `Execution exceeds its audit-trail limit of ${dataLimits.maxAuditBytes} bytes.`)
+        const policyDecision = Policy.decide(options?.policy, name)
+        if (policyDecision.action === "deny") {
+          throw new ToolRuntimeError("UnknownCapability", `Unknown tool '${name}'.`)
         }
-        auditBytes += auditEntryBytes
-        calls.push(call)
-        if (name === "search") {
+        if (name === "$rune.search") {
           const input = externalArgs[0]
           if (externalArgs.length !== 1 || input === null || typeof input !== "object" || Array.isArray(input)) {
-            throw new ToolRuntimeError("InvalidToolInput", "tools.search expects { query?: string; limit?: number }.")
+            throw new ToolRuntimeError("InvalidToolInput", "tools.$rune.search expects { query?: string; limit?: number }.")
           }
           const request = input as { query?: unknown; limit?: unknown }
           if (request.query !== undefined && typeof request.query !== "string") {
-            throw new ToolRuntimeError("InvalidToolInput", "tools.search query must be a string when provided.")
+            throw new ToolRuntimeError("InvalidToolInput", "tools.$rune.search query must be a string when provided.")
           }
           if (request.limit !== undefined && (typeof request.limit !== "number" || !Number.isFinite(request.limit) || request.limit <= 0)) {
-            throw new ToolRuntimeError("InvalidToolInput", "tools.search limit must be a positive number when provided.")
+            throw new ToolRuntimeError("InvalidToolInput", "tools.$rune.search limit must be a positive number when provided.")
           }
           const query = typeof request.query === "string" ? request.query.toLowerCase() : ""
+          if (policyDecision.action === "requireApproval") {
+            const requestApproval = options?.requestApproval
+            if (!requestApproval) throw new ToolRuntimeError("ApprovalDenied", `Capability '${name}' requires approval, but no requestApproval handler is configured.`)
+            const approved = yield* Effect.suspend(() => {
+              const result = requestApproval({ path: name, input: externalArgs[0], ...(policyDecision.reason ? { reason: policyDecision.reason } : {}) })
+              return Effect.isEffect(result) ? result : Effect.succeed(result)
+            })
+            if (!approved) throw new ToolRuntimeError("ApprovalDenied", policyDecision.reason ?? `Approval denied for capability '${name}'.`)
+          }
+          recordCall(call)
           const matched = visibleCatalog
             .filter((item) => `${item.path} ${item.definition.description}`.toLowerCase().includes(query))
             .map((item) => ({ path: item.path, description: item.definition.description }))
           const limit = typeof request.limit === "number" ? Math.floor(request.limit) : 12
-          return checkedCopyIn({ items: matched.slice(0, limit), total: matched.length }, "Result from tool 'search'")
+          return checkedCopyIn({ items: matched.slice(0, limit), total: matched.length }, "Result from tool '$rune.search'")
         }
-        if (name === "describe") {
+        if (name === "$rune.describe") {
           const input = externalArgs[0]
           const requested = input !== null && typeof input === "object" && !Array.isArray(input)
             ? (input as { path?: unknown }).path
             : undefined
           if (externalArgs.length !== 1 || typeof requested !== "string") {
-            throw new ToolRuntimeError("InvalidToolInput", "tools.describe expects { path: string }.")
+            throw new ToolRuntimeError("InvalidToolInput", "tools.$rune.describe expects { path: string }.")
           }
+          if (policyDecision.action === "requireApproval") {
+            const requestApproval = options?.requestApproval
+            if (!requestApproval) throw new ToolRuntimeError("ApprovalDenied", `Capability '${name}' requires approval, but no requestApproval handler is configured.`)
+            const approved = yield* Effect.suspend(() => {
+              const result = requestApproval({ path: name, input: externalArgs[0], ...(policyDecision.reason ? { reason: policyDecision.reason } : {}) })
+              return Effect.isEffect(result) ? result : Effect.succeed(result)
+            })
+            if (!approved) throw new ToolRuntimeError("ApprovalDenied", policyDecision.reason ?? `Approval denied for capability '${name}'.`)
+          }
+          recordCall(call)
           const found = visibleCatalog.find((item) => item.path === requested)
           if (!found) throw new ToolRuntimeError("UnknownCapability", `Unknown tool '${String(requested)}'.`)
-          return checkedCopyIn(found.description, "Result from tool 'describe'")
+          return checkedCopyIn(found.description, "Result from tool '$rune.describe'")
         }
 
         const tool = resolve(tools, path)
@@ -301,6 +342,7 @@ export const make = <R, RA = never>(
           })
           if (!approved) throw new ToolRuntimeError("ApprovalDenied", decision.reason ?? `Approval denied for capability '${name}'.`)
         }
+        recordCall(call)
         if (isDefinition(tool)) {
           const raw = yield* tool.run(describedInput)
           const result = yield* Effect.try({
@@ -315,4 +357,4 @@ export const make = <R, RA = never>(
   }
 }
 
-export * as ToolRuntime from "./tool-runtime.ts"
+export * as ToolRuntime from "./tool-runtime.js"
