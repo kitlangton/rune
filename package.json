@@ -1,0 +1,51 @@
+{
+  "name": "rune",
+  "module": "./src/rune.ts",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/rune.ts",
+    "./tool": "./src/tool.ts",
+    "./promise": "./src/promise.ts",
+    "./ai-sdk": "./src/ai-sdk.ts",
+    "./effect-ai": "./src/effect-ai.ts",
+    "./policy": "./src/policy.ts",
+    "./clock": "./src/clock.ts",
+    "./store": "./src/store.ts",
+    "./fs": "./src/fs.ts",
+    "./http": "./src/http.ts"
+  },
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "demo:dev": "vite --config vite.config.ts",
+    "demo:build": "vite build --config vite.config.ts",
+    "demo:preview": "vite preview --config vite.config.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p site/tsconfig.json",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@effect/language-service": "0.86.2",
+    "@types/bun": "latest",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "fast-check": "^4.8.0",
+    "vite": "^8.0.14"
+  },
+  "dependencies": {
+    "acorn": "^8.15.0",
+    "effect": "^4.0.0-beta.74",
+    "motion": "^12.40.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "ai": "^6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ai": {
+      "optional": true
+    }
+  }
+}
