@@ -81,9 +81,12 @@
     "demo:preview": "vite preview --config vite.config.ts",
     "typecheck": "rm -rf dist site-dist && tsc --noEmit && tsc --noEmit -p site/tsconfig.json",
     "test": "bun test",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
     "check:release": "bun run typecheck && bun run test && bun run build",
     "prepack": "bun run build",
-    "prepublishOnly": "bun run check:release"
+    "prepublishOnly": "bun run check:release",
+    "release": "bun run check:release && changeset publish"
   },
   "devDependencies": {
     "@effect/language-service": "0.86.2",
@@ -91,6 +94,7 @@
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",
+    "@changesets/cli": "^2.29.7",
     "effect": "^4.0.0-beta.74",
     "fast-check": "^4.8.0",
     "motion": "^12.40.0",

@@ -353,3 +353,15 @@ bun install
 bun run typecheck
 bun test
 ```
+
+## Releases
+
+Rune uses Changesets for package releases after the initial `0.1.0` publication:
+
+```bash
+bun run changeset          # record a user-facing change
+bun run version-packages   # apply pending version/changelog updates
+bun run release            # validate and publish to npm
+```
+
+`bun run release` publishes `@kitlangton/rune` and may require npm browser/OTP authorization from the authenticated maintainer account.
