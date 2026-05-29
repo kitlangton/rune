@@ -81,12 +81,12 @@
     "demo:preview": "vite preview --config vite.config.ts",
     "typecheck": "rm -rf dist site-dist && tsc --noEmit && tsc --noEmit -p site/tsconfig.json",
     "test": "bun test",
-    "changeset": "changeset",
-    "version-packages": "changeset version",
+    "changeset": "bunx changeset",
+    "version-packages": "bunx changeset version",
     "check:release": "bun run typecheck && bun run test && bun run build",
     "prepack": "bun run build",
     "prepublishOnly": "bun run check:release",
-    "release": "bun run check:release && changeset publish"
+    "release": "bun run check:release && bunx changeset publish"
   },
   "devDependencies": {
     "@effect/language-service": "0.86.2",

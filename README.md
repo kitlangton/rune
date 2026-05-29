@@ -359,9 +359,9 @@ bun test
 Rune uses Changesets for package releases after the initial `0.1.0` publication:
 
 ```bash
-bun run changeset          # record a user-facing change
+bun run changeset          # record a user-facing change via bunx Changesets
 bun run version-packages   # apply pending version/changelog updates
-bun run release            # validate and publish to npm
+bun run release            # validate and publish to npm via Changesets
 ```
 
 `bun run release` publishes `@kitlangton/rune` and may require npm browser/OTP authorization from the authenticated maintainer account.
